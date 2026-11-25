@@ -1,0 +1,302 @@
+{
+  "started_utc": "2026-11-25T16:01:05.666Z",
+  "idle_timeout_seconds": 4,
+  "idle": {
+    "before": [
+      {
+        "pid": 13629,
+        "ppid": 13344,
+        "start": "402285",
+        "state": "S",
+        "name": "npm exec @playw"
+      },
+      {
+        "pid": 13642,
+        "ppid": 13629,
+        "start": "402312",
+        "state": "S",
+        "name": "sh"
+      },
+      {
+        "pid": 13643,
+        "ppid": 13642,
+        "start": "402312",
+        "state": "S",
+        "name": "node-MainThread"
+      },
+      {
+        "pid": 13655,
+        "ppid": 13643,
+        "start": "402371",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13662,
+        "ppid": 13655,
+        "start": "402374",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13663,
+        "ppid": 13655,
+        "start": "402374",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13688,
+        "ppid": 13655,
+        "start": "402377",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13687,
+        "ppid": 13662,
+        "start": "402377",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13691,
+        "ppid": 13663,
+        "start": "402377",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13754,
+        "ppid": 13663,
+        "start": "402384",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13763,
+        "ppid": 13663,
+        "start": "402386",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13764,
+        "ppid": 13663,
+        "start": "402386",
+        "state": "S",
+        "name": "chrome"
+      }
+    ],
+    "remaining": [],
+    "survivor_pids": [
+      13444,
+      13457,
+      13458,
+      13470,
+      13477,
+      13478,
+      13503,
+      13499,
+      13542,
+      13569,
+      13578,
+      13579
+    ],
+    "elapsed_ms": 4045
+  },
+  "crash": {
+    "before": [
+      {
+        "pid": 13812,
+        "ppid": 13344,
+        "start": "402829",
+        "state": "S",
+        "name": "npm exec @playw"
+      },
+      {
+        "pid": 13825,
+        "ppid": 13812,
+        "start": "402854",
+        "state": "S",
+        "name": "sh"
+      },
+      {
+        "pid": 13826,
+        "ppid": 13825,
+        "start": "402854",
+        "state": "S",
+        "name": "node-MainThread"
+      },
+      {
+        "pid": 13838,
+        "ppid": 13826,
+        "start": "402906",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13844,
+        "ppid": 13838,
+        "start": "402909",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13846,
+        "ppid": 13838,
+        "start": "402909",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13870,
+        "ppid": 13838,
+        "start": "402911",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13869,
+        "ppid": 13844,
+        "start": "402911",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13874,
+        "ppid": 13846,
+        "start": "402912",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13939,
+        "ppid": 13846,
+        "start": "402917",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13948,
+        "ppid": 13846,
+        "start": "402919",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13951,
+        "ppid": 13846,
+        "start": "402919",
+        "state": "S",
+        "name": "chrome"
+      }
+    ],
+    "remaining": [],
+    "survivor_pids": [
+      13444,
+      13457,
+      13458,
+      13470,
+      13477,
+      13478,
+      13503,
+      13499,
+      13542,
+      13569,
+      13578,
+      13579
+    ],
+    "elapsed_ms": 11111
+  },
+  "survivor": {
+    "before": [
+      {
+        "pid": 13444,
+        "ppid": 13344,
+        "start": "402112",
+        "state": "S",
+        "name": "npm exec @playw"
+      },
+      {
+        "pid": 13457,
+        "ppid": 13444,
+        "start": "402164",
+        "state": "S",
+        "name": "sh"
+      },
+      {
+        "pid": 13458,
+        "ppid": 13457,
+        "start": "402164",
+        "state": "S",
+        "name": "node-MainThread"
+      },
+      {
+        "pid": 13470,
+        "ppid": 13458,
+        "start": "402198",
+        "state": "R",
+        "name": "chrome"
+      },
+      {
+        "pid": 13477,
+        "ppid": 13470,
+        "start": "402215",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13478,
+        "ppid": 13470,
+        "start": "402215",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13503,
+        "ppid": 13470,
+        "start": "402226",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13499,
+        "ppid": 13477,
+        "start": "402225",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13542,
+        "ppid": 13478,
+        "start": "402230",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13569,
+        "ppid": 13478,
+        "start": "402249",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13578,
+        "ppid": 13478,
+        "start": "402252",
+        "state": "S",
+        "name": "chrome"
+      },
+      {
+        "pid": 13579,
+        "ppid": 13478,
+        "start": "402252",
+        "state": "S",
+        "name": "chrome"
+      }
+    ],
+    "final": "SESSION-PROBE",
+    "remaining": []
+  }
+}

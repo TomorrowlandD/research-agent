@@ -84,7 +84,8 @@ socket.onmessage = ({data}) => {
   }
   historyBox.scrollTop = historyBox.scrollHeight;
 };
-socket.onclose = () => {
-  availability(true, "连接已断开，刷新可开始新会话");
+socket.onclose = ({code}) => {
+  const reason = code === 4001 ? "会话因空闲已关闭" : "连接已断开";
+  availability(true, reason + "，刷新可开始新会话");
   for (const item of historyBox.querySelectorAll("button")) item.disabled = true;
 };

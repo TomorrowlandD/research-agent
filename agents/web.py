@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -13,16 +14,26 @@ from .agent import Agent
 from .main import _load_env_file, _resolve_api_config
 
 
+DEFAULT_IDLE_TIMEOUT = 900
+IDLE_CLOSE_CODE = 4001
 ASSETS = Path(__file__).with_name("web_ui")
 
 
 class BrowserSession:
-    def __init__(self, socket, make_agent):
+    def __init__(self, socket, make_agent, idle_timeout):
         self.socket = socket
+        self.idle_timeout = idle_timeout
+        self.idle_timer = None
         self.pending = {}
         self.turn = None
         self.agent = make_agent(confirm_fn=self.confirm, output_fn=self.output)
         self.agent.set_plan_approval_fn(self.review_plan)
+
+    def waiting_for_input(self, waiting):
+        # The receive handler owns this timeout; running a model/tool has no idle deadline.
+        if self.idle_timer is not None and not self.idle_timer.expired():
+            deadline = asyncio.get_running_loop().time() + self.idle_timeout if waiting else None
+            self.idle_timer.reschedule(deadline)
 
     async def output(self, text):
         await self.socket.send_json({"type": "output", "text": text})
@@ -31,6 +42,7 @@ class BrowserSession:
         request_id = uuid4().hex
         decision = asyncio.get_running_loop().create_future()
         self.pending[request_id] = decision
+        self.waiting_for_input(True)
         try:
             await self.socket.send_json({"type": "approval", "id": request_id, "label": label, "message": message})
             return await decision
@@ -57,6 +69,8 @@ class BrowserSession:
         else:
             if not self.socket.closed:
                 await self.socket.send_json({"type": "complete"})
+        finally:
+            self.waiting_for_input(True)
 
     async def receive(self, data):
         kind = data.get("type") if isinstance(data, dict) else None
@@ -67,6 +81,7 @@ class BrowserSession:
             elif not isinstance(prompt, str) or not prompt.strip():
                 error = "请输入任务。"
             else:
+                self.waiting_for_input(False)
                 self.turn = asyncio.create_task(self.run_turn(prompt.strip()))
                 return
         elif kind == "decision":
@@ -76,6 +91,7 @@ class BrowserSession:
                 error = "审批无效或已处理。"
             else:
                 future.set_result(data["allow"])
+                self.waiting_for_input(any(not f.done() for f in self.pending.values()))
                 return
         else:
             error = "无效的会话消息。"
@@ -86,10 +102,10 @@ class BrowserSession:
             self.turn.cancel()
             await asyncio.gather(self.turn, return_exceptions=True)
         try:
-            await self.agent.drain_background_skill_tasks()
+            await self.agent._mcp_manager.disconnect_all()
         finally:
             try:
-                await self.agent._mcp_manager.disconnect_all()
+                await self.agent.drain_background_skill_tasks()
             finally:
                 client = self.agent._openai_client or self.agent._anthropic_client
                 await client.close()
@@ -105,7 +121,9 @@ async def local_browser(request, handler):
     return await handler(request)
 
 
-def create_app(make_agent):
+def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT):
+    if not math.isfinite(idle_timeout) or idle_timeout <= 0:
+        raise ValueError("idle_timeout must be a positive finite duration")
     app = web.Application(middlewares=[local_browser])
     sockets = set()
 
@@ -118,21 +136,28 @@ def create_app(make_agent):
         })
 
     async def connect(request):
-        socket = web.WebSocketResponse(max_msg_size=128 * 1024)
-        session = BrowserSession(socket, make_agent)
+        socket = web.WebSocketResponse(max_msg_size=128 * 1024, heartbeat=30)
+        session = BrowserSession(socket, make_agent, idle_timeout)
         try:
             await socket.prepare(request)
             sockets.add(socket)
             await socket.send_json({"type": "ready"})
-            async for frame in socket:
-                if frame.type != WSMsgType.TEXT:
-                    break
-                try:
-                    data = json.loads(frame.data)
-                except ValueError:
-                    data = None
-                await session.receive(data)
+            async with asyncio.timeout(idle_timeout) as timer:
+                session.idle_timer = timer
+                async for frame in socket:
+                    if frame.type != WSMsgType.TEXT:
+                        break
+                    try:
+                        data = json.loads(frame.data)
+                    except ValueError:
+                        data = None
+                    await session.receive(data)
+        except TimeoutError:
+            if session.idle_timer is None or not session.idle_timer.expired():
+                raise
+            await socket.close(code=IDLE_CLOSE_CODE, message=b"Session idle timeout")
         finally:
+            session.idle_timer = None
             sockets.discard(socket)
             await session.close()
         return socket
@@ -150,14 +175,19 @@ def create_app(make_agent):
 def main():
     parser = argparse.ArgumentParser(description="ResearchAgent 本地 Web 会话")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
+                        help="等待任务或审批的最长秒数（默认 900）")
     args = parser.parse_args()
+    if not math.isfinite(args.idle_timeout) or args.idle_timeout <= 0:
+        parser.error("--idle-timeout must be a positive finite duration")
     _load_env_file()
     base, key, openai = _resolve_api_config(None)
     if not key:
         parser.error("请先在环境变量或 .env 中配置模型 API 密钥。")
     options = {"api_key": key, "api_base" if openai else "anthropic_base_url": base,
                "model": os.environ.get("MODEL") or "deepseek-chat"}
-    web.run_app(create_app(lambda **callbacks: Agent(**options, **callbacks)), host="127.0.0.1", port=args.port)
+    app = create_app(lambda **callbacks: Agent(**options, **callbacks), idle_timeout=args.idle_timeout)
+    web.run_app(app, host="127.0.0.1", port=args.port)
 
 
 if __name__ == "__main__":

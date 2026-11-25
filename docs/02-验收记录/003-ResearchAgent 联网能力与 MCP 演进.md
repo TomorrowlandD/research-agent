@@ -1,6 +1,6 @@
 # 003 ResearchAgent 联网能力与 MCP 演进验收记录
 
-2026-11-25 · WSL Ubuntu · P0、P1、P2 和 P3.1 已验收，P1 搜索服务商实网调用待补证
+2026-11-26 · WSL Ubuntu · P0、P1、P2、P3.1 和 P3.2 已验收，P1 搜索服务商实网调用待补证
 
 [对应技术方案（03）](<../01-技术方案改造/03-ResearchAgent 联网能力与 MCP 演进技术方案文档.md>)
 
@@ -13,7 +13,7 @@ P0、P1 和 P2 各子阶段的执行条件、实测数据及验证范围见下�
 | P0 基础建设与基线 | 在 WSL/Linux 验证 Playwright 启动、连接与清理超时、错误透传和 JSONL Trace。运行 MCP 回归测试，并保留同一组基线任务的耗时、工具调用次数及 Token 用量。 | 已验收，2026-11-25 |
 | P1 联网能力与角色隔离 | 常规查询通过内置搜索和抓取完成；交互页面可委派给仅挂载白名单浏览器工具的 `explore`。验证重复只读查询命中缓存，并核对缓存与 Trace 的实现位置。 | WSL 通过；搜索服务商仅完成离线接口测试 |
 | P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | 已验收。静态与交互整轮断网回放、10 轮配对量化对照通过 |
-| P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | P3.1 Web 会话与审批通过，P3.2 和 P3.3 待验收 |
+| P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | P3.1 Web 会话与审批、P3.2 会话回收通过，P3.3 待验收 |
 
 ## 实际验收记录
 
@@ -171,6 +171,27 @@ node tests/fixtures/web_session_browser.cjs http://127.0.0.1:8765 /path/to/tempo
 ```
 
 下一项 P3.2 验证多标签页空闲超时、异常关闭后的进程退出，以及其他活跃会话是否仍能完成任务。
+
+### P3.2 · 多标签页会话回收 · 2026-11-26
+
+基底 `0e43222`，WSL Ubuntu、Python 3.11.18、aiohttp 3.14.5、Linux Node 26.13.1、Playwright MCP 0.0.86。单标签页默认等待期限为 900 秒，可用 `--idle-timeout` 调整。等待用户输入和审批时计时；执行模型／工具期间暂停空闲计时。WebSocket 心跳用于发现失联客户端。关闭时取消该会话的运行任务，沿现有主／子 Agent 清理路径释放 stdio MCP 连接。
+
+实机使用同一 Chromium 客户端的三个标签页，模型使用固定响应控制委派和暂停位置。每个 `explore` 实际启动独立 MCP 和 Chromium，审批、导航及快照均走运行时。将验收空闲期限设为 4 秒，通过 Linux `/proc` 的 PID 和启动时钟标识比对进程，僵尸仍算残留。
+
+| 检查 | 正式实测结果 |
+| --- | --- |
+| 空闲等待审批 | 已导航，等待 `browser_snapshot` 审批。页面收到空闲关闭状态。MCP 根 PID 13629 的 12 个已跟踪进程（含 9 个 Chromium 进程）全部退出。自取样至确认退出为 4.045 秒。 |
+| 异常关页 | 浏览器已导航，模型请求仍在运行，通过 CDP `Page.crash` 使客户端渲染进程崩溃。MCP 根 PID 13812 的 12 个已跟踪进程全部退出。自触发崩溃至确认退出为 11.111 秒。 |
+| 活跃会话隔离 | 在上述两次回收后，另一标签页 MCP 根 PID 13444 的全部 12 个原进程仍在。恢复该会话的模型响应后，在同一标签页批准快照，读到页面中的 `SESSION-PROBE` 并完成任务。子 Agent 正常结束后跟踪进程也全部退出。 |
+| 回归 | Web 会话专项 8 项通过。覆盖首次连接、待审批超时、运行中超过空闲期限、完成后重新计时及非法时长。完整回归 123 项，120 通过、3 项 Windows 专用用例跳过。 |
+
+```bash
+python -s -B -m unittest discover -s tests -p 'test_web_session.py' -v
+python -s -B -m unittest discover -s tests -v
+PYTHONPATH=. python -s -B tests/fixtures/web_session_lifecycle.py /tmp/researchagent-session-processes.json
+```
+
+实机命令需在 Linux 提供 Node、可由 `require("playwright")` 加载的 Playwright 包、已安装的 Chromium 及共享库。本次沿用已预热的 npm 缓存及 P2 阶段临时解包的库；未使用外部模型 API。耗时为本机该次观测。[逐进程证据](003-P3.2会话进程验收.json)
 
 ## 后续待验收与 Agent 交接
 

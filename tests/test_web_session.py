@@ -1,4 +1,5 @@
 """Exercise the local WebSocket entry point with the real permission and tool loops."""
+import asyncio
 from contextlib import chdir
 import json
 import os
@@ -8,11 +9,11 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
-from aiohttp import WSServerHandshakeError
+from aiohttp import WSMsgType, WSServerHandshakeError
 from aiohttp.test_utils import TestClient, TestServer
 
 from agents.agent import Agent
-from agents.web import create_app
+from agents.web import IDLE_CLOSE_CODE, create_app
 from test_deepseek_thinking import FakeStream, answer, call, chunk
 
 
@@ -45,6 +46,7 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.dict(os.environ, {"HOME": tmp, "USERPROFILE": tmp, "RESEARCH_TOOL_MODE": "live"}))
         self.protocol = "openai"
         self.results = []
+        self.model_gate = None
         self.client = TestClient(TestServer(create_app(self.make_agent)))
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
@@ -56,6 +58,8 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
                       enable_memory_prefetch=False, enable_mcp=False, **callbacks)
 
         async def respond(**kwargs):
+            if self.model_gate is not None:
+                await self.model_gate.wait()
             messages = kwargs["messages"]
             last = messages[-1]
             if last["role"] == "user" and isinstance(last["content"], str):
@@ -75,8 +79,10 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(create, "create", respond))
         return agent
 
-    async def connect(self):
-        socket = await self.client.ws_connect("/session", origin=str(self.client.make_url("/")).rstrip("/"))
+    async def connect(self, client=None):
+        if client is None:
+            client = self.client
+        socket = await client.ws_connect("/session", origin=str(client.make_url("/")).rstrip("/"))
         self.assertEqual((await socket.receive_json(timeout=5))["type"], "ready")
         return socket
 
@@ -128,6 +134,52 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
         await second.close()
         self.assertFalse((self.root / "pending.txt").exists())
         self.assertFalse((self.root / "overlap.txt").exists())
+
+    async def short_lived_client(self):
+        client = TestClient(TestServer(create_app(self.make_agent, idle_timeout=0.25)))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def expect_idle_close(self, socket):
+        frame = await socket.receive(timeout=4)
+        self.assertEqual((frame.type, frame.data), (WSMsgType.CLOSE, IDLE_CLOSE_CODE))
+        await socket.close()
+
+    async def test_connected_session_without_work_expires(self):
+        socket = await self.connect(await self.short_lived_client())
+        await self.expect_idle_close(socket)
+
+    async def test_waiting_for_approval_expires_without_executing(self):
+        socket = await self.connect(await self.short_lived_client())
+        await socket.send_json({"type": "prompt", "text": "expired.txt"})
+        self.assertEqual((await socket.receive_json(timeout=4))["type"], "started")
+        self.assertEqual((await socket.receive_json(timeout=4))["type"], "approval")
+        await self.expect_idle_close(socket)
+        self.assertFalse((self.root / "expired.txt").exists())
+
+    async def test_active_model_survives_other_timeout_and_then_expires_after_completion(self):
+        self.model_gate = asyncio.Event()
+        client = await self.short_lived_client()
+        active = await self.connect(client)
+        await active.send_json({"type": "prompt", "text": "active.txt"})
+        self.assertEqual((await active.receive_json(timeout=4))["type"], "started")
+        await self.expect_idle_close(await self.connect(client))
+        self.model_gate.set()
+        approval = await active.receive_json(timeout=4)
+        await active.send_json({"type": "decision", "id": approval["id"], "allow": True})
+        while True:
+            event = await active.receive_json(timeout=4)
+            if event["type"] == "complete":
+                break
+            self.assertEqual(event["type"], "output", event)
+        self.assertEqual((self.root / "active.txt").read_text(), "approved")
+        await self.expect_idle_close(active)
+
+    def test_idle_timeout_must_be_positive_and_finite(self):
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                create_app(self.make_agent, idle_timeout=value)
 
     async def test_foreign_origin_and_host_are_rejected(self):
         with self.assertRaises(WSServerHandshakeError) as raised:
