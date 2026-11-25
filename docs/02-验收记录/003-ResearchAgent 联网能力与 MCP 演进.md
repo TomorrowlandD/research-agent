@@ -1,6 +1,6 @@
 # 003 ResearchAgent 联网能力与 MCP 演进验收记录
 
-2026-11-26 · WSL Ubuntu · P0、P1、P2、P3.1 和 P3.2 已验收，P1 搜索服务商实网调用待补证
+2026-11-26 · WSL Ubuntu · P0、P1、P2 和 P3 Web MVP 已验收，P1 搜索服务商实网调用待补证
 
 [对应技术方案（03）](<../01-技术方案改造/03-ResearchAgent 联网能力与 MCP 演进技术方案文档.md>)
 
@@ -13,7 +13,7 @@ P0、P1 和 P2 各子阶段的执行条件、实测数据及验证范围见下�
 | P0 基础建设与基线 | 在 WSL/Linux 验证 Playwright 启动、连接与清理超时、错误透传和 JSONL Trace。运行 MCP 回归测试，并保留同一组基线任务的耗时、工具调用次数及 Token 用量。 | 已验收，2026-11-25 |
 | P1 联网能力与角色隔离 | 常规查询通过内置搜索和抓取完成；交互页面可委派给仅挂载白名单浏览器工具的 `explore`。验证重复只读查询命中缓存，并核对缓存与 Trace 的实现位置。 | WSL 通过；搜索服务商仅完成离线接口测试 |
 | P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | 已验收。静态与交互整轮断网回放、10 轮配对量化对照通过 |
-| P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | P3.1 Web 会话与审批、P3.2 会话回收通过，P3.3 待验收 |
+| P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | P3.1–P3.3 均已验收，Web MVP 里程碑完成 |
 
 ## 实际验收记录
 
@@ -192,6 +192,26 @@ PYTHONPATH=. python -s -B tests/fixtures/web_session_lifecycle.py /tmp/researcha
 ```
 
 实机命令需在 Linux 提供 Node、可由 `require("playwright")` 加载的 Playwright 包、已安装的 Chromium 及共享库。本次沿用已预热的 npm 缓存及 P2 阶段临时解包的库；未使用外部模型 API。耗时为本机该次观测。[逐进程证据](003-P3.2会话进程验收.json)
+
+### P3.3 · Web Trace 面板 · 2026-11-26
+
+基底 `af3842d`。WSL Ubuntu、Python 3.11.18、aiohttp、本机无头 Chromium。主 Agent 在任务结束时按本轮 trace ID 读取已有 JSONL，将记录随完成或失败事件返回到所属 WebSocket。页面按 span ID 和父 span ID 组树，按开始时间排列同级调用，保留每轮独立面板。
+
+| 检查 | 实测结果 |
+| --- | --- |
+| 调用树和逐条耗时 | Chromium 实际展开面板并与原始 JSONL 的 4 行逐条核对。主 Agent 的委派耗时 150.295 ms，两个 `explore/web_fetch` 子调用分别为 130.375 ms 和 0.132 ms。另一根节点 `main/read_file` 为 0.071 ms，错误类型为 `ToolFailure`。DOM 父节点、角色、各条耗时及相对刻度、来源、开始时间、标识和输出字符数均与原始记录一致。 |
+| 缓存与任务边界 | 两次抓取规范化为同一个 URL，上游页面只收到 1 次请求。面板显示只读工具命中 1/2（50%）。第二轮无工具任务获得新的 trace ID，上一轮的 4 个节点仍可展开。390 像素视口没有横向溢出。 |
+| 异常及回归 | 任务发生异常后保留已经完成的工具记录。读取损坏或重复记录时保留有效行并标注不完整。OpenAI、Anthropic 的 WebSocket 回归均核对完成事件及未获批准的工具未产生执行 span。Web 专项 10 项通过；完整回归 125 项，122 通过，3 项 Windows 专用用例跳过。 |
+
+```bash
+PYTHONPATH=. python -s -B tests/fixtures/web_trace_panel.py /tmp/researchagent-web-trace.jsonl
+python -s -B -m unittest discover -s tests -p 'test_web_session.py' -v
+python -s -B -m unittest discover -s tests -v
+```
+
+实机命令需 Linux Node、可通过 `require("playwright")` 加载的包及可用 Chromium，`PLAYWRIGHT_BROWSERS_PATH` 指向已安装的浏览器目录。模型响应固定；浏览器、委派、回环 HTTP、缓存、落盘和前端渲染均实际执行。[正式验收原始 JSONL](003-P3.3调用追踪.jsonl)
+
+P3 的 Web 会话与审批、会话回收、Trace 面板三项均已验收。P1 搜索服务商实网调用仍待密钥补证；Streamable HTTP 服务池待实际并发数据支持时另行排期。
 
 ## 后续待验收与 Agent 交接
 

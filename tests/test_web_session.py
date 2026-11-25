@@ -13,7 +13,7 @@ from aiohttp import WSMsgType, WSServerHandshakeError
 from aiohttp.test_utils import TestClient, TestServer
 
 from agents.agent import Agent
-from agents.web import IDLE_CLOSE_CODE, create_app
+from agents.web import IDLE_CLOSE_CODE, create_app, read_turn_trace
 from test_deepseek_thinking import FakeStream, answer, call, chunk
 
 
@@ -88,6 +88,7 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def check_approval_paths(self):
         socket = await self.connect()
+        trace_ids = set()
         for allow in (True, False):
             name = f"{self.protocol}-{allow}.txt"
             await socket.send_json({"type": "prompt", "text": name})
@@ -101,6 +102,11 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
             while True:
                 event = await socket.receive_json(timeout=5)
                 if event["type"] == "complete":
+                    trace = event["trace"]
+                    self.assertNotIn(trace["id"], trace_ids)
+                    trace_ids.add(trace["id"])
+                    self.assertFalse(trace["partial"])
+                    self.assertEqual([s["tool_name"] for s in trace["spans"]], ["write_file"] if allow else [])
                     break
                 self.assertEqual(event["type"], "output", event)
                 output.append(event["text"])
@@ -117,6 +123,31 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_anthropic_decisions_continue_same_session(self):
         self.protocol = "anthropic"
         await self.check_approval_paths()
+
+    def test_damaged_trace_keeps_valid_rows_and_excludes_foreign_or_duplicate_spans(self):
+        directory = self.root / ".research" / "traces"
+        directory.mkdir(parents=True)
+        row = {"trace_id": "own", "span_id": "one", "parent_span_id": None, "tool_name": "web_fetch",
+               "agent_role": "main", "timestamp": "2026-11-26T00:00:00Z", "source_type": "builtin",
+               "latency_ms": 1.25, "ok": True, "cache_hit": False, "output_chars": 5, "error_type": None}
+        rows = [json.dumps(row), "{broken", json.dumps({**row, "trace_id": "other"}),
+                json.dumps(row), json.dumps({**row, "span_id": "two", "latency_ms": None})]
+        (directory / "own.jsonl").write_text("\n".join(rows), encoding="utf-8")
+        self.assertEqual(read_turn_trace("own"), {"id": "own", "partial": True, "spans": [row]})
+
+    async def test_failed_turn_keeps_its_completed_tool_span(self):
+        with patch("agents.agent.Agent._auto_save", side_effect=RuntimeError("fixture failure")):
+            socket = await self.connect()
+            await socket.send_json({"type": "prompt", "text": "before-failure.txt"})
+            self.assertEqual((await socket.receive_json(timeout=5))["type"], "started")
+            approval = await socket.receive_json(timeout=5)
+            await socket.send_json({"type": "decision", "id": approval["id"], "allow": True})
+            event = await socket.receive_json(timeout=5)
+            while event["type"] == "output":
+                event = await socket.receive_json(timeout=5)
+            self.assertEqual(event["type"], "failed")
+            self.assertEqual([s["tool_name"] for s in event["trace"]["spans"]], ["write_file"])
+            await socket.close()
 
     async def test_pending_approval_is_bound_to_session_and_turn(self):
         first, second = await self.connect(), await self.connect()

@@ -82,6 +82,7 @@ socket.onmessage = ({data}) => {
     entry("会话提示", event.message);
     if (event.type === "failed") availability(false, "任务中断");
   }
+  if (event.trace) historyBox.append(renderTurnTrace(event.trace));
   historyBox.scrollTop = historyBox.scrollHeight;
 };
 socket.onclose = ({code}) => {

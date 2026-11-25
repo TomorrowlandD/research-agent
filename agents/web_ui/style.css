@@ -180,3 +180,79 @@ button:focus-visible,textarea:focus-visible {
   }
 
 }
+
+.turn-trace {
+  margin: 12px 0 20px;
+  padding: 11px 14px;
+  border: 1px solid #d4dcd2;
+  border-radius: 8px;
+  background: #f6f8f3;
+  font-size: .85rem;
+}
+.trace-title, .trace-call {
+  cursor: pointer;
+}
+.trace-title {
+  color: #315642;
+  font-weight: 650;
+}
+.trace-id, .trace-fields dd {
+  overflow-wrap: anywhere;
+  font-family: "IBM Plex Mono", monospace;
+}
+.trace-id {
+  display: block;
+  margin-top: 8px;
+  color: #526056;
+}
+.trace-tree, .trace-children {
+  list-style: none;
+  padding: 0;
+}
+.trace-children {
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 2px solid #c5d6c7;
+}
+.trace-call {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 9px;
+  padding: 5px 0;
+}
+.trace-call::before {
+  content: "▸";
+}
+.trace-span > details[open] > .trace-call::before {
+  content: "▾";
+}
+.trace-tool {
+  font-family: "IBM Plex Mono", monospace;
+  overflow-wrap: anywhere;
+}
+.trace-role, .trace-note {
+  color: #526056;
+}
+.trace-call meter {
+  width: 58px;
+  align-self: center;
+}
+.trace-duration {
+  font-variant-numeric: tabular-nums;
+}
+.trace-hit {
+  color: #275e40;
+}
+.trace-failure {
+  color: #9d322c;
+}
+.trace-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 4px 0 10px 13px;
+}
+.trace-fields dd {
+  margin: 0;
+}

@@ -11,12 +11,48 @@ from uuid import uuid4
 from aiohttp import WSMsgType, web
 
 from .agent import Agent
+from .paths import RESEARCH_DIRNAME
 from .main import _load_env_file, _resolve_api_config
 
 
 DEFAULT_IDLE_TIMEOUT = 900
 IDLE_CLOSE_CODE = 4001
 ASSETS = Path(__file__).with_name("web_ui")
+
+
+def read_turn_trace(trace_id):
+    """Load only the completed turn selected by the server-side Agent."""
+    rows = []
+    seen = set()
+    partial = False
+    path = Path.home() / RESEARCH_DIRNAME / "traces" / f"{trace_id}.jsonl"
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    partial = True
+                    continue
+                if not isinstance(row, dict) or row.get("trace_id") != trace_id:
+                    partial = True
+                    continue
+                labels = ("span_id", "tool_name", "agent_role", "timestamp", "source_type")
+                latency = row.get("latency_ms")
+                if (not all(isinstance(row.get(k), str) and row[k] for k in labels)
+                        or row["span_id"] in seen or type(latency) not in (int, float)
+                        or not math.isfinite(latency) or latency < 0
+                        or type(row.get("cache_hit")) is not bool or type(row.get("ok")) is not bool):
+                    partial = True
+                    continue
+                seen.add(row["span_id"])
+                rows.append(row)
+    except FileNotFoundError:
+        pass  # The runtime creates a trace file on the first executed tool call.
+    except (OSError, UnicodeError):
+        partial = True
+        logging.getLogger(__name__).warning("Cannot read trace %s", trace_id)
+    return {"id": trace_id, "spans": rows, "partial": partial}
 
 
 class BrowserSession:
@@ -58,17 +94,19 @@ class BrowserSession:
 
     async def run_turn(self, prompt):
         await self.socket.send_json({"type": "started"})
+        previous_trace = self.agent.trace_id
         try:
-            await self.agent.chat(prompt)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logging.getLogger(__name__).exception("Web session turn failed")
+            try:
+                await self.agent.chat(prompt)
+            except Exception as exc:
+                logging.getLogger(__name__).exception("Web session turn failed")
+                event = {"type": "failed", "message": f"任务中断（{type(exc).__name__}），请检查服务端日志。"}
+            else:
+                event = {"type": "complete"}
             if not self.socket.closed:
-                await self.socket.send_json({"type": "failed", "message": f"任务中断（{type(exc).__name__}），请检查服务端日志。"})
-        else:
-            if not self.socket.closed:
-                await self.socket.send_json({"type": "complete"})
+                if self.agent.trace_id != previous_trace:
+                    event["trace"] = await asyncio.to_thread(read_turn_trace, self.agent.trace_id)
+                await self.socket.send_json(event)
         finally:
             self.waiting_for_input(True)
 
@@ -166,7 +204,7 @@ def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT):
         await asyncio.gather(*(ws.close(code=1001) for ws in list(sockets)))
 
     app.router.add_get("/", page)
-    app.router.add_get("/{asset:app\\.js|style\\.css}", page)
+    app.router.add_get("/{asset:app\\.js|trace\\.js|style\\.css}", page)
     app.router.add_get("/session", connect)
     app.on_shutdown.append(shutdown)
     return app
