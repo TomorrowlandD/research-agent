@@ -16,7 +16,7 @@ from .paths import RESEARCH_DIRNAME
 from .tool_result import ToolExecutionResult, ToolFailure
 from .web_cache import WebCache
 from .web_tools import external_content, normalize_web_args
-from .tool_snapshot import write_tool_snapshot
+from .tool_snapshot import replay_tool_snapshot, write_tool_snapshot
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Callable, Awaitable, Any
@@ -198,8 +198,13 @@ class Agent:
         self._permitted_mcp_tools = None if permitted_mcp_tools is None else set(permitted_mcp_tools)
         self._web_cache = web_cache if web_cache is not None else WebCache()
         self.tool_mode = os.getenv("RESEARCH_TOOL_MODE", "live").strip().lower()
-        if self.tool_mode not in {"live", "record"}:
-            raise ValueError("RESEARCH_TOOL_MODE must be live or record")
+        if self.tool_mode not in {"live", "record", "replay"}:
+            raise ValueError("RESEARCH_TOOL_MODE must be live, record or replay")
+        if self.tool_mode == "replay":
+            snapshot = os.getenv("RESEARCH_TOOL_SNAPSHOT")
+            if not snapshot:
+                raise ValueError("RESEARCH_TOOL_SNAPSHOT must select a recorded snapshot in replay mode")
+            self._replay_snapshot = Path(snapshot).expanduser()
         self.trace_id = uuid.uuid4().hex
         self._api_base = api_base
         self._anthropic_base_url = anthropic_base_url
@@ -1350,8 +1355,12 @@ class Agent:
         try:
             if name not in {tool["name"] for tool in self.tools}:
                 raise ToolFailure(f"Tool not available in this run: {name}")
-            if name in {"web_search", "web_fetch"}:
+            is_web_tool = name in {"web_search", "web_fetch"}
+            if is_web_tool:
                 inp = normalize_web_args(name, inp)
+            if self.tool_mode == "replay":
+                result = replay_tool_snapshot(self._replay_snapshot, name, inp)
+            elif is_web_tool:
                 result = await self._web_cache.execute(name, inp, self._dispatch_tool)
             else:
                 raw = await self._dispatch_tool(name, inp)

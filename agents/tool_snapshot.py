@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from .paths import RESEARCH_DIRNAME
-from .tool_result import ToolExecutionResult
+from .tool_result import ToolExecutionResult, ToolFailure
 
 
 def write_tool_snapshot(trace_id: str, span_id: str, name: str, args: dict,
@@ -19,3 +19,21 @@ def write_tool_snapshot(trace_id: str, span_id: str, name: str, args: dict,
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+class SnapshotMissing(ToolFailure):
+    """The selected recording contains no result for this tool call."""
+
+
+def replay_tool_snapshot(path: Path, name: str, args: dict) -> ToolExecutionResult:
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SnapshotMissing(f"Snapshot missing: {path}") from exc
+    if row["tool_name"] != name or row["normalized_args"] != args:
+        raise SnapshotMissing(f"Snapshot missing for {name} with the supplied arguments in {path.name}.")
+    result = row["result"]
+    if not (isinstance(result["content"], str) and isinstance(result["is_error"], bool)
+            and isinstance(result["meta"], dict)):
+        raise ValueError(f"Invalid tool result in snapshot {path.name}")
+    return ToolExecutionResult(**result)

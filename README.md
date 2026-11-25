@@ -130,6 +130,8 @@ npm exec --yes --package=@playwright/mcp@0.0.86 -- playwright install --with-dep
 
 需要保存一次任务的完整工具结果时，可在启动 CLI 前设置 `RESEARCH_TOOL_MODE=record`。快照位于 `~/.research/snapshots/<trace_id>/<span_id>.json`，包含工具名、规范化参数和完整返回内容；同一工具多次调用分别保存。默认模式为 `live`。录制文件可能包含查询内容和本地文件正文，请按原始数据的访问权限保管。
 
+单次工具回放使用 `RESEARCH_TOOL_MODE=replay`，并用 `RESEARCH_TOOL_SNAPSHOT` 指定录制所得的一个 JSON 文件，例如 `~/.research/snapshots/<trace_id>/<span_id>.json`。新会话中的工具名和规范化参数匹配时，直接返回该次录制的正文、错误标志及元数据。快照缺失或参数不匹配时返回工具错误，回放路径不会访问上游或读写联网工具缓存。此模式只回放单次工具结果，启动常规 CLI 对话仍会调用模型。
+
 ## 源码与测试
 
 命令行入口在 [agents/main.py](agents/main.py)。理解长程任务如何继续执行，可从[会话折叠](agents/session_memory.py)和[会话保存](agents/session.py)读起。用户反馈如何变成可复用方法，见 [Skills 在线更新](agents/online_skill_evolution.py)和[版本与来源记录](agents/skill_evolution.py)。

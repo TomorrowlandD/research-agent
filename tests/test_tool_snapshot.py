@@ -16,8 +16,12 @@ class ToolSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch("pathlib.Path.home", return_value=self.home))
         self.snapshots = self.home / ".research" / "snapshots"
 
-    def agent(self, mode=None):
+    def agent(self, mode=None, snapshot=None):
         with patch.dict(os.environ):
+            if snapshot is not None:
+                os.environ["RESEARCH_TOOL_SNAPSHOT"] = str(snapshot)
+            else:
+                os.environ.pop("RESEARCH_TOOL_SNAPSHOT", None)
             if mode is None:
                 os.environ.pop("RESEARCH_TOOL_MODE", None)
             else:
@@ -25,7 +29,7 @@ class ToolSnapshotTests(unittest.IsolatedAsyncioTestCase):
             return Agent(api_base="https://example.invalid", api_key="unused",
                          custom_system_prompt="test", enable_mcp=False)
 
-    async def test_record_fixed_page_and_cache_hit(self):
+    async def test_record_fixed_page_and_replay_after_server_shutdown(self):
         body = ("<article><p>" + "sample observation " * 2100 + "END-483</p></article>").encode()
         requests = []
 
@@ -58,6 +62,23 @@ class ToolSnapshotTests(unittest.IsolatedAsyncioTestCase):
                             for row in rows))
         self.assertCountEqual([row["result"] for row in rows], [asdict(first), asdict(second)])
 
+        # Both calls selected below run after the loopback server has closed.
+        for path, row in zip(files, rows):
+            replay = self.agent("replay", path)
+            with (patch.object(replay._web_cache, "execute") as cache,
+                  patch.object(replay, "_dispatch_tool") as dispatch,
+                  patch("httpx.AsyncClient.send") as upstream):
+                hit = await replay._execute_tool_call("web_fetch", {"url": url + "#replay"})
+                miss = await replay._execute_tool_call("web_fetch", {"url": url + "/unrecorded"})
+                self.assertEqual(asdict(hit), row["result"])
+                self.assertTrue(miss.is_error)
+                self.assertEqual(miss.meta["error_type"], "SnapshotMissing")
+                self.assertIn("Snapshot missing", miss.content)
+                upstream.assert_not_called()
+                dispatch.assert_not_called()
+                cache.assert_not_called()
+        self.assertEqual(len(requests), 1)
+
     async def test_default_live_writes_no_snapshot_and_record_preserves_error(self):
         args = {"file_path": str(self.home / "missing.txt")}
         live = await self.agent()._execute_tool_call("read_file", args)
@@ -68,3 +89,17 @@ class ToolSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(failure.is_error)
         path, = (self.snapshots / agent.trace_id).glob("*.json")
         self.assertEqual(json.loads(path.read_text())["result"], asdict(failure))
+        Path(args["file_path"]).write_text("now exists")
+        replay = self.agent("replay", path)
+        with patch.object(replay, "_dispatch_tool") as dispatch:
+            self.assertEqual(await replay._execute_tool_call("read_file", args), failure)
+            wrong_tool = await replay._execute_tool_call("web_fetch", {"url": "https://example.org/"})
+            self.assertEqual(wrong_tool.meta["error_type"], "SnapshotMissing")
+            path.unlink()
+            missing = await replay._execute_tool_call("read_file", args)
+            self.assertEqual(missing.meta["error_type"], "SnapshotMissing")
+            dispatch.assert_not_called()
+
+    def test_replay_requires_source_snapshot(self):
+        with self.assertRaisesRegex(ValueError, "RESEARCH_TOOL_SNAPSHOT"):
+            self.agent("replay")
