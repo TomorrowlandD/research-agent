@@ -17,7 +17,7 @@ ResearchAgent 是一个面向长程科研任务的 Python Agent 运行时。它�
 
 ## 项目架构
 
-`agents/main.py` 处理交互输入、一次性任务和会话恢复。主 Agent 在每轮对话中检索相关 Skills，可按需预取项目记忆。启用 MCP 时，主 Agent 会在首次对话时连接已配置的服务，并将发现的外部工具加入可用列表。[CLI 入口](agents/main.py) · [Agent 主循环](agents/agent.py) · [MCP 客户端](agents/mcp_client.py)
+`agents/main.py` 处理交互输入、一次性任务和会话恢复。主 Agent 在每轮对话中检索相关 Skills，可按需预取项目记忆。启用 MCP 时，各角色在首次对话时连接获准的服务。默认由主 Agent 搜索和抓取静态页面，需要交互时可委派 explore 打开浏览器。[CLI 入口](agents/main.py) · [Agent 主循环](agents/agent.py) · [MCP 客户端](agents/mcp_client.py)
 
 ```mermaid
 flowchart TD
@@ -110,9 +110,25 @@ python -m agents.main --resume
 
 用户设置、会话和项目记忆保存在 `~/.research/`。项目配置、Skills、规则、子 Agent 和折叠记录保存在项目的 `.research/` 下，由 Git 整体忽略。项目专用环境变量使用 `RESEARCH_` 前缀，例如 `RESEARCH_DEEPSEEK_THINKING`、`RESEARCH_AUTO_SKILL_EVOLUTION`。
 
-## 当前重构重点
+## 联网查询
 
-第一项改造是让 WSL 和 Linux 容器都能启动 MCP 工具。仓库目前为 Context7 和 Playwright 配置了 Windows 本机的 `npx.cmd` 绝对路径，Docker 镜像也会复制这份配置。改造的验收条件是在目标环境中通过项目客户端启动两个服务、列出工具，并在会话退出后回收子进程。[MCP 配置](.mcp.json) · [客户端](agents/mcp_client.py) · [Dockerfile](Dockerfile)
+已有 URL 时，`web_fetch` 通过 HTTP 获取静态正文，无需搜索密钥。查找未知来源时，`web_search` 默认使用 Tavily。在项目根目录 `.env` 中配置 `TAVILY_API_KEY` 即可；使用 Serper 时设置 `RESEARCH_SEARCH_PROVIDER=serper` 和 `SERPER_API_KEY`。一次查询只使用选定的服务商。搜索正文和抓取结果以外部数据标记传入模型。[环境变量示例](.env.example)
+
+主 Agent 和 `explore` 子 Agent 共享当前会话的成功搜索、抓取结果，TTL 为 30 分钟。Trace 的 `cache_hit` 可区分复用与实际请求。浏览器操作每次执行。遇到需要点击或动态渲染的页面，主 Agent 可以把 URL 与要核实的问题交给 `explore`。
+
+## MCP 启动与工具日志
+
+先在运行 CLI 的环境中安装 Node.js，确认 `node` 和 `npx` 均在 PATH 上。WSL 使用 Linux 的 Node.js。项目配置通过 PATH 解析 Context7 和 Playwright 的启动命令。Playwright MCP 固定为 `0.0.86`，使用独立的无头 Chromium，并关闭图片回传。首次运行前，可在同一用户环境中安装配套浏览器和 Linux 运行库。
+
+```bash
+npm exec --yes --package=@playwright/mcp@0.0.86 -- playwright install --with-deps chromium
+```
+
+默认配置仅为 `explore` 启动 Playwright，并开放 8 个导航、快照与交互工具。每个 MCP 服务可配置 `roles` 和 `allowed_tools`。省略 `roles` 的旧声明仍归主 Agent；`roles: []` 关闭该服务的自动挂载。仓库的 Context7 配置保留为可选项，如需原有用法可将其 `roles` 改为 `["main"]`。服务名须非空且不含 `__`。连接就绪限时 20 秒，初始化和工具发现各限时 15 秒。退出时，清理超过 15 秒会告警，达到 30 秒时报告超时。服务自身的诊断输出追加到 `~/.research/logs/mcp-<服务名>.stderr.log`。
+
+每轮对话实际执行的工具调用记录在 `~/.research/traces/<trace_id>.jsonl`。每行包含工具、角色、耗时、输出字符数及成功或失败状态，子 Agent 调用通过父 span 关联。参数校验和审批在执行前完成，读取工具调用次数时按执行记录计数。超过 30 KiB 的结果仍走原有落盘流程。[MCP 配置](.mcp.json) · [P0/P1 验收记录](<docs/02-验收记录/003-ResearchAgent 联网能力与 MCP 演进.md>)
+
+需要保存一次任务的完整工具结果时，可在启动 CLI 前设置 `RESEARCH_TOOL_MODE=record`。快照位于 `~/.research/snapshots/<trace_id>/<span_id>.json`，包含工具名、规范化参数和完整返回内容；同一工具多次调用分别保存。默认模式为 `live`。录制文件可能包含查询内容和本地文件正文，请按原始数据的访问权限保管。
 
 ## 源码与测试
 

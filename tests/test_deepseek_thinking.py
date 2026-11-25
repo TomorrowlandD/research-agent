@@ -8,6 +8,8 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace as NS
 import unittest
+
+from agents.tool_result import ToolExecutionResult
 from unittest.mock import AsyncMock, Mock, patch
 
 import openai
@@ -147,7 +149,7 @@ class DeepSeekThinkingTests(unittest.IsolatedAsyncioTestCase):
             FakeStream(chunk(reasoning="search reason", calls=[call(args='{"pattern":"thinking","path":"agents/agent.py"}', name="grep_search", ident="search_1")], finish="tool_calls")),
             answer("done", "answer reason"), answer("follow-up", "follow-up reason"),
         ]
-        with patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value="result") as execute:
+        with patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value=ToolExecutionResult("result")) as execute:
             await agent._chat_openai("read then search")
             await agent._chat_openai("continue")
         self.assertEqual(execute.await_count, 2)
@@ -177,7 +179,7 @@ class DeepSeekThinkingTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = openai.AsyncOpenAI(api_key="test-placeholder", base_url="https://api.deepseek.com", http_client=http_client)
             agent._openai_client = client
-            with patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value="mock result"):
+            with patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value=ToolExecutionResult("mock result")):
                 await agent._chat_openai("read")
                 await agent._chat_openai("follow-up")
             await client.close()

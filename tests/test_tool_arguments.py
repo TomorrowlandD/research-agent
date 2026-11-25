@@ -5,6 +5,8 @@ from contextlib import ExitStack
 import json
 from types import SimpleNamespace as NS
 import unittest
+
+from agents.tool_result import ToolExecutionResult
 from unittest.mock import AsyncMock, patch
 
 import anthropic
@@ -105,7 +107,7 @@ class ToolArgumentLoopTests(unittest.IsolatedAsyncioTestCase):
                         if len(started) == 2:
                             both_started.set()
                         await asyncio.wait_for(both_started.wait(), timeout=2)
-                    return "ok"
+                    return ToolExecutionResult("ok")
 
                 specs = [("read_file", "null"), ("read_file", '{"file_path":"a"}'),
                          ("read_file", '{"file_path":"b"}'), ("run_shell", '{"command":12}'),
@@ -150,7 +152,7 @@ class ToolArgumentLoopTests(unittest.IsolatedAsyncioTestCase):
         responses = [NS(content=blocks, stop_reason="tool_use", usage=NS(input_tokens=0, output_tokens=0)),
                      NS(content=[], stop_reason="end_turn", usage=NS(input_tokens=0, output_tokens=0))]
         with patch.object(agent, "_call_anthropic_stream", AsyncMock(side_effect=responses)), \
-             patch.object(agent, "_execute_tool_call", AsyncMock(return_value="ok")) as execute:
+             patch.object(agent, "_execute_tool_call", AsyncMock(return_value=ToolExecutionResult("ok"))) as execute:
             await agent._chat_anthropic("test")
         self.assertEqual(execute.await_count, 2)
         self.assertEqual(self.permission.call_count, 2)
@@ -169,7 +171,7 @@ class ToolArgumentLoopTests(unittest.IsolatedAsyncioTestCase):
                     "type": "object", "required": ["query"], "properties": {"query": {"type": "string"}},
                 }}]
                 agent.tools += agent._mcp_manager.get_tool_definitions()
-                connection = NS(call_tool=AsyncMock(return_value="mcp ok"))
+                connection = NS(call_tool=AsyncMock(return_value=ToolExecutionResult("mcp ok")))
                 agent._mcp_manager._connections["demo"] = connection
                 name = "mcp__demo__query"
                 if provider == "openai":
@@ -190,6 +192,42 @@ class ToolArgumentLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.permission.assert_called_once()
                 self.assertIn("Invalid arguments", results[0]["content"])
                 self.assertEqual(results[1]["content"], "mcp ok")
+
+    async def test_mcp_status_drives_protocol_statistics_and_trace(self):
+        import tempfile
+        from pathlib import Path
+
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temp:
+                agent = self.agent(provider)
+                name = "mcp__demo__lookup"
+                agent._mcp_manager._tools = [{"serverName": "demo", "name": "lookup"}]
+                agent.tools += agent._mcp_manager.get_tool_definitions()
+                outcomes = [ToolExecutionResult("timeout error reference"),
+                            ToolExecutionResult.failure("missing sample", "mcp_tool_error")]
+                agent._mcp_manager._connections["demo"] = NS(call_tool=AsyncMock(side_effect=outcomes))
+                with patch("agents.agent.Path.home", return_value=Path(temp)):
+                    if provider == "openai":
+                        results = await self.run_openai(agent, [
+                            call(name=name, args="{}", ident=str(i), index=i) for i in range(2)
+                        ])
+                    else:
+                        blocks = [NS(type="tool_use", name=name, id=str(i), input={}) for i in range(2)]
+                        replies = [NS(content=blocks, stop_reason="tool_use", usage=NS(input_tokens=0, output_tokens=0)),
+                                   NS(content=[], stop_reason="end_turn", usage=NS(input_tokens=0, output_tokens=0))]
+                        with patch.object(agent, "_call_anthropic_stream", AsyncMock(side_effect=replies)):
+                            await agent._chat_anthropic("test")
+                        results = agent._anthropic_messages[2]["content"]
+                        self.assertEqual([r["is_error"] for r in results], [False, True])
+                self.assertEqual([r["content"] for r in results], [r.content for r in outcomes])
+                self.assertEqual(agent._tool_error_streak, 1)
+                trace = Path(temp) / ".research" / "traces" / f"{agent.trace_id}.jsonl"
+                rows = [json.loads(line) for line in trace.read_text().splitlines()]
+                self.assertEqual([r["ok"] for r in rows], [True, False])
+                self.assertEqual([r["error_type"] for r in rows], [None, "mcp_tool_error"])
+                self.assertEqual([r["output_chars"] for r in rows], [len(r.content) for r in outcomes])
+                self.assertEqual(len({r["span_id"] for r in rows}), 2)
+                self.assertTrue(all(r["source_type"] == "mcp" and not r["cache_hit"] for r in rows))
 
     async def test_anthropic_broken_ids_fail_before_any_execution(self):
         for bad_id in (None, "", "good", 7):
@@ -245,7 +283,7 @@ class ToolArgumentLoopTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = anthropic.AsyncAnthropic(api_key="test-placeholder", http_client=http_client)
             agent._anthropic_client = client
-            with patch.object(agent, "_execute_tool_call", AsyncMock(return_value="ok")) as execute:
+            with patch.object(agent, "_execute_tool_call", AsyncMock(return_value=ToolExecutionResult("ok"))) as execute:
                 await agent._chat_anthropic("test")
             await client.close()
         self.assertEqual(execute.await_count, 2)

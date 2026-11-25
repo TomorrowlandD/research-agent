@@ -1,0 +1,136 @@
+[
+  {
+    "case": "static",
+    "model": "deepseek-v4-pro",
+    "trace_id": "7e70b4272cb14f4b9d32c19bd8f675d3",
+    "seconds": 10.279,
+    "tool_calls": 2,
+    "tools": [
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot"
+    ],
+    "main_tokens": {
+      "input": 32626,
+      "output": 105
+    },
+    "side_tokens": {
+      "input": 0,
+      "output": 0
+    },
+    "answer": "NL-4827",
+    "expected": "NL-4827",
+    "passed": true,
+    "spans": [
+      {
+        "timestamp": "2026-11-25T10:44:08.888705+00:00",
+        "trace_id": "7e70b4272cb14f4b9d32c19bd8f675d3",
+        "span_id": "71a07eb1d0d644f2b140c2c792fd4f4c",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_navigate",
+        "source_type": "mcp",
+        "latency_ms": 301.599,
+        "output_chars": 345,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:44:10.954458+00:00",
+        "trace_id": "7e70b4272cb14f4b9d32c19bd8f675d3",
+        "span_id": "d06dd373268e45aeb31821a43bbac740",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "source_type": "mcp",
+        "latency_ms": 7.674,
+        "output_chars": 241,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      }
+    ]
+  },
+  {
+    "case": "interactive",
+    "model": "deepseek-v4-pro",
+    "trace_id": "8a96f699cf5f45e7b433fed30db4559d",
+    "seconds": 13.585,
+    "tool_calls": 4,
+    "tools": [
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_snapshot"
+    ],
+    "main_tokens": {
+      "input": 55186,
+      "output": 211
+    },
+    "side_tokens": {
+      "input": 0,
+      "output": 0
+    },
+    "answer": "SW-6319",
+    "expected": "SW-6319",
+    "passed": true,
+    "spans": [
+      {
+        "timestamp": "2026-11-25T10:44:14.781245+00:00",
+        "trace_id": "8a96f699cf5f45e7b433fed30db4559d",
+        "span_id": "8385c1f9882b4a72af5cdb995bfbb690",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_navigate",
+        "source_type": "mcp",
+        "latency_ms": 245.771,
+        "output_chars": 345,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:44:16.381818+00:00",
+        "trace_id": "8a96f699cf5f45e7b433fed30db4559d",
+        "span_id": "c7dccb6074fb470e819204d88a1e2bce",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "source_type": "mcp",
+        "latency_ms": 21.32,
+        "output_chars": 240,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:44:18.402276+00:00",
+        "trace_id": "8a96f699cf5f45e7b433fed30db4559d",
+        "span_id": "6ff443e5a46b42e2890b15a2b12726e4",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_click",
+        "source_type": "mcp",
+        "latency_ms": 1120.829,
+        "output_chars": 264,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:44:21.783828+00:00",
+        "trace_id": "8a96f699cf5f45e7b433fed30db4559d",
+        "span_id": "32905ec8e7014840be97dbdf9f9a2877",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "source_type": "mcp",
+        "latency_ms": 7.265,
+        "output_chars": 258,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      }
+    ]
+  }
+]

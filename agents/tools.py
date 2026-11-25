@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 
 from .paths import RESEARCH_DIRNAME
+from .tool_result import ToolFailure
+from .web_tools import normalize_web_args, web_fetch, web_search
 
 from tqdm.utils import IS_WIN
 from jsonschema import ValidationError, validate
@@ -43,12 +45,12 @@ def validate_tool_arguments(name: str, arguments: object, tools: list[ToolDef], 
 #权限模式
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
 
-READ_TOOLS = {"read_file", "list_files", "grep_search", "compact_context"}
+READ_TOOLS = {"web_search", "web_fetch", "read_file", "list_files", "grep_search", "compact_context"}
 EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
 
 
 #并发安全的工具可以并行运行（只读，无副作用）
-CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
+CONCURRENCY_SAFE_TOOLS = {"web_search", "web_fetch", "read_file", "list_files", "grep_search"}
 
 
 
@@ -69,6 +71,21 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
 
 #工具定义
 tool_definitions: list[ToolDef] = [
+    {
+        "name": "web_search",
+        "description": "Find web sources for a query. Returns titles, URLs and short snippets.",
+        "input_schema": {"type": "object", "required": ["query"], "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "max_results": {"type": "integer", "description": "Default 5, clamped to 1–10."},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "web_fetch",
+        "description": "Read the static text of a known HTTP(S) URL as Markdown. For interaction delegate to explore.",
+        "input_schema": {"type": "object", "required": ["url"], "properties": {
+            "url": {"type": "string", "minLength": 1},
+        }, "additionalProperties": False},
+    },
     {
         "name": "read_file",
         "description": "Read the contents of a file. Returns the file content with line numbers.",
@@ -226,7 +243,7 @@ tool_definitions: list[ToolDef] = [
     },
     {
         "name": "agent",
-        "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
+        "description": "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only research, including dynamic pages and browser interaction), 'plan' (read-only, structured planning), 'general' (full tools).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -288,7 +305,7 @@ def _read_file(inp:dict) -> str:
         numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
         return numbered
     except Exception as e:
-        return f"Error reading file: {e}"
+        raise ToolFailure(f"Error reading file: {e}")
 
 def _write_file(inp:dict) -> str:
     try:
@@ -302,7 +319,7 @@ def _write_file(inp:dict) -> str:
         trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
         return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
     except Exception as e:
-        return f"Error writing file: {e}"
+        raise ToolFailure(f"Error writing file: {e}")
 
 def _auto_update_memory_index(file_path:str) -> None:
     try:
@@ -370,11 +387,11 @@ def _edit_file(inp: dict) -> str:
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
-            return f"Error: old_string not found in {inp['file_path']}"
+            raise ToolFailure(f"Error: old_string not found in {inp['file_path']}")
 
         occurrences = content.count(inp["old_string"])
         if occurrences > 1:
-            return f"Error: old_string found {occurrences} times in {inp['file_path']}. Must be unique."
+            raise ToolFailure(f"Error: old_string found {occurrences} times in {inp['file_path']}. Must be unique.")
 
         new_content = content.replace(actual, inp["new_string"], 1)
         path.write_text(new_content)
@@ -384,8 +401,10 @@ def _edit_file(inp: dict) -> str:
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
 
         return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
+    except ToolFailure:
+        raise
     except Exception as e:
-        return f"Error editing file: {e}"
+        raise ToolFailure(f"Error editing file: {e}")
 
 
 def _list_files(inp: dict) -> str:
@@ -410,7 +429,7 @@ def _list_files(inp: dict) -> str:
             result += f"\n...and {len(files) - 200} more files are found ..."
         return result
     except Exception as e:
-        return f"Error listing files: {e}"
+        raise ToolFailure(f"Error listing files: {e}")
 
 
 def _grep_search(inp: dict) -> str:
@@ -447,11 +466,11 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
         regex = re.compile(pattern)
         search_path = Path(directory)
         if not search_path.exists():
-            return f"Error searching files: path does not exist: {search_path}"
+            raise ToolFailure(f"Error searching files: path does not exist: {search_path}")
         if not search_path.is_file() and not search_path.is_dir():
-            return f"Error searching files: not a file or directory: {search_path}"
+            raise ToolFailure(f"Error searching files: not a file or directory: {search_path}")
     except (re.error, OSError) as e:
-        return f"Error searching files: {e}"
+        raise ToolFailure(f"Error searching files: {e}")
 
     matches: list[str] = []
     errors: list[str] = []
@@ -498,7 +517,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
         walk(str(search_path))
     if not matches:
         if errors:
-            return "Error searching files: search incomplete; no matches in readable files.\n" + "\n".join(errors[:10])
+            raise ToolFailure("Error searching files: search incomplete; no matches in readable files.\n" + "\n".join(errors[:10]))
         return "No matches found."
     output = "\n".join(matches[:100])
     if len(matches) > 100:
@@ -565,12 +584,14 @@ def _run_shell(inp: dict) -> str:
         if result.returncode != 0:
             stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
             stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+            raise ToolFailure(f"Command failed (exit code {result.returncode}){stdout}{stderr}")
         return output or "(no output)"
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
+        raise TimeoutError(f"Command timed out after {timeout_ms}ms") from None
+    except ToolFailure:
+        raise
     except Exception as e:
-        return f"Error: {e}"
+        raise ToolFailure(f"Error: {e}")
 
 
 #危险命令检测模式列表
@@ -751,9 +772,13 @@ def check_permission(
 async def execute_tool(
     name: str, inp: dict, read_file_state: dict[str, float] | None = None
 ) -> str:
+    if name == "web_search":
+        return await web_search(**normalize_web_args(name, inp))
+    if name == "web_fetch":
+        return await web_fetch(**normalize_web_args(name, inp))
     if name == "read_file":
         result = _read_file(inp)
-        if read_file_state is not None and not result.startswith("Error"):
+        if read_file_state is not None:
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
                 read_file_state[abs_path] =  os.path.getmtime(abs_path)
@@ -766,10 +791,10 @@ async def execute_tool(
         if os.path.exists(abs_path):
             if abs_path not in read_file_state:
                 verb = "writing" if name == "write_file" else "editing"
-                return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
+                raise ToolFailure(f"Error: You must read this file before {verb}. Use read_file first to see its current contents.")
             if os.path.getmtime(abs_path) != read_file_state[abs_path]:
                 verb = "writing" if name == "write_file" else "editing"
-                return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
+                raise ToolFailure(f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}.")
 
     #搜索和激活延迟加载的工具。
     if name == "tool_search":
@@ -799,7 +824,10 @@ async def execute_tool(
             rationale=inp.get("rationale", ""),
             target=inp.get("target", "active"),
         )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        content = _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        if not result.get("ok"):
+            raise ToolFailure(content)
+        return content
 
     if name == "skill_create":
         from .skills import create_skill
@@ -815,7 +843,10 @@ async def execute_tool(
             allowed_tools=inp.get("allowed_tools"),
             evidence=inp.get("evidence", ""),
         )
-        return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        content = _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
+        if not result.get("ok"):
+            raise ToolFailure(content)
+        return content
 
     handlers: dict = {
         "write_file": _write_file,
@@ -827,12 +858,12 @@ async def execute_tool(
     handler = handlers.get(name)
 
     if not handler:
-        return f"Unknown tool: {name}"
+        raise ToolFailure(f"Unknown tool: {name}")
 
     result = _truncate_result(handler(inp))
 
     # 更新时间
-    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
+    if name in ("write_file", "edit_file") and read_file_state is not None:
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=False).resolve())
         try:
             read_file_state[abs_path] = os.path.getmtime(abs_path)

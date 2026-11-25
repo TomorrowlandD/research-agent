@@ -8,9 +8,16 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .paths import RESEARCH_DIRNAME
+from .tool_result import ToolExecutionResult, ToolFailure
+from .web_cache import WebCache
+from .web_tools import external_content, normalize_web_args
+from .tool_snapshot import write_tool_snapshot
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Callable, Awaitable, Any
 
@@ -44,6 +51,8 @@ from agents.ui import print_info, print_divider, print_assistant_text, print_sub
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
     print_error
 
+
+_tool_span = ContextVar("tool_span", default=None)
 
 # 指数退避重试
 
@@ -161,6 +170,9 @@ class Agent:
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
                  is_sub_agent: bool=False,
+                 agent_role: str | None=None,
+                 permitted_mcp_tools: list[str] | None=None,
+                 web_cache: WebCache | None=None,
                  enable_folding: bool=True,
                  max_fold_limit: int | None=None,
                  fold_memory_mode: str="single_json",
@@ -182,6 +194,13 @@ class Agent:
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
+        self.agent_role = agent_role or ("sub_agent" if is_sub_agent else "main")
+        self._permitted_mcp_tools = None if permitted_mcp_tools is None else set(permitted_mcp_tools)
+        self._web_cache = web_cache if web_cache is not None else WebCache()
+        self.tool_mode = os.getenv("RESEARCH_TOOL_MODE", "live").strip().lower()
+        if self.tool_mode not in {"live", "record"}:
+            raise ValueError("RESEARCH_TOOL_MODE must be live or record")
+        self.trace_id = uuid.uuid4().hex
         self._api_base = api_base
         self._anthropic_base_url = anthropic_base_url
         self._api_key = api_key
@@ -209,7 +228,8 @@ class Agent:
         self.enable_online_evolution = enable_online_evolution
         self.fold_observer = fold_observer
         available_tools = tool_definitions if custom_tools is None else custom_tools
-        self.tools = [tool for tool in available_tools if enable_folding or tool["name"] != "compact_context"]
+        self.tools = [tool for tool in available_tools if not tool["name"].startswith("mcp__")
+                      and (enable_folding or tool["name"] != "compact_context")]
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
@@ -511,14 +531,20 @@ class Agent:
     #主入口
 
     async def  chat(self, user_message:str)->None:
+        parent = _tool_span.get()
+        self.trace_id = parent[0] if parent else uuid.uuid4().hex
         #懒加载MCP服务在第一次chat的时候
-        if self.enable_mcp and not self._mcp_initialized and not self.is_sub_agent:
+        if self.enable_mcp and not self._mcp_initialized:
             self._mcp_initialized = True
             try:
-                await self._mcp_manager.load_and_connect()
-                mcp_defs = self._mcp_manager.get_tool_definitions()
+                await self._mcp_manager.load_and_connect(self.agent_role, permitted_tools=self._permitted_mcp_tools)
+                mcp_defs = self._mcp_manager.get_tool_definitions(self.agent_role)
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
+            except asyncio.CancelledError:
+                self._mcp_initialized = False
+                await self._mcp_manager.disconnect_all()
+                raise
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
@@ -540,6 +566,8 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
+            if self.is_sub_agent and asyncio.current_task().cancelling():
+                raise
 
         finally:
             self._current_task = None
@@ -567,7 +595,13 @@ class Agent:
         prev_out = self.total_output_tokens
         prev_side = (self.side_input_tokens, self.side_output_tokens)
         prev_usage = (self.cache_hit_tokens, self.cache_miss_tokens, self.reasoning_tokens, self._deepseek_cost_usd)
-        await self.chat(prompt)
+        try:
+            await self.chat(prompt)
+        finally:
+            if self.is_sub_agent:
+                await self._mcp_manager.disconnect_all()
+                self._mcp_initialized = False
+                self.tools = [tool for tool in self.tools if not tool["name"].startswith("mcp__")]
         text = "".join(self._output_buffer)
         self._output_buffer = None
         return {
@@ -661,14 +695,6 @@ class Agent:
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
-
-    def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
-        text = f"{raw}\n{result}".lower()
-        if any(marker in text for marker in ("error", "denied", "timed out", "timeout")):
-            return True
-        if tool_name == "compact_context" and "no context compaction" in text:
-            return True
-        return False
 
     def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
         try:
@@ -1286,12 +1312,12 @@ class Agent:
 
         d = Path.home() / RESEARCH_DIRNAME / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
-        filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
+        filename = f"{uuid.uuid4().hex}-{tool_name}.txt"
         filepath = d / filename
         filepath.write_text(result, encoding="utf-8")
 
         lines = result.split("\n")
-        preview = "\n".join(lines[:200])
+        preview = "\n".join(lines[:200])[:8192]
         size_kb = len(result.encode()) / 1024
 
         return (
@@ -1314,9 +1340,56 @@ class Agent:
             raise ValueError(f"Duplicate tool call ID: {call_id}; no tools executed.")
         seen_ids.add(call_id)
 
-    async def _execute_tool_call(self, name: str, inp: dict) -> str:
-        if name not in {tool["name"] for tool in self.tools} and not self._mcp_manager.is_mcp_tool(name):
-            return f"Tool not available in this run: {name}"
+    async def _execute_tool_call(self, name: str, inp: dict) -> ToolExecutionResult:
+        start = time.monotonic()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        parent = _tool_span.get()
+        span_id = uuid.uuid4().hex
+        token = _tool_span.set((self.trace_id, span_id))
+        result = None
+        try:
+            if name not in {tool["name"] for tool in self.tools}:
+                raise ToolFailure(f"Tool not available in this run: {name}")
+            if name in {"web_search", "web_fetch"}:
+                inp = normalize_web_args(name, inp)
+                result = await self._web_cache.execute(name, inp, self._dispatch_tool)
+            else:
+                raw = await self._dispatch_tool(name, inp)
+                result = raw if isinstance(raw, ToolExecutionResult) else ToolExecutionResult(raw)
+        except asyncio.CancelledError:
+            result = ToolExecutionResult.failure("Tool execution cancelled.", "CancelledError")
+            raise
+        except ToolFailure as exc:
+            result = ToolExecutionResult.failure(str(exc), type(exc).__name__)
+        except Exception as exc:
+            result = ToolExecutionResult.failure(f"Error executing tool: {exc}", type(exc).__name__)
+        finally:
+            _tool_span.reset(token)
+            if result is not None:
+                self._write_tool_trace(name, result, timestamp, start, span_id, parent)
+        if self.tool_mode == "record":
+            write_tool_snapshot(self.trace_id, span_id, name, inp, result)
+        return result
+
+    def _write_tool_trace(self, name: str, result: ToolExecutionResult, timestamp: str,
+                          start: float, span_id: str, parent: tuple[str, str] | None) -> None:
+        row = {
+            "timestamp": timestamp, "trace_id": self.trace_id, "span_id": span_id,
+            "parent_span_id": parent[1] if parent else None, "agent_role": self.agent_role,
+            "tool_name": name, "source_type": "mcp" if name.startswith("mcp__") else "builtin",
+            "latency_ms": round((time.monotonic() - start) * 1000, 3),
+            "output_chars": len(result.content), "cache_hit": result.meta.get("cache_hit", False), "ok": result.ok,
+            "error_type": result.meta.get("error_type"),
+        }
+        try:
+            directory = Path.home() / RESEARCH_DIRNAME / "traces"
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / f"{self.trace_id}.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row) + "\n")
+        except OSError as exc:
+            logging.warning("Cannot write tool trace: %s", exc)
+
+    async def _dispatch_tool(self, name: str, inp: dict) -> str | ToolExecutionResult:
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):
@@ -1325,10 +1398,14 @@ class Agent:
             return await self._execute_agent_tool(inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
-            # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
-            return await self._mcp_manager.call_tool(name, inp)
+            result = await self._mcp_manager.call_tool(name, inp)
+            if name.split("__", 2)[-1].startswith("browser_"):
+                return replace(result, content=external_content(name, result.content))
+            return result
         result = await execute_tool(name, inp, self._read_file_state)
+        if name == "read_file" and ".playwright-mcp" in Path(inp["file_path"]).parts:
+            return external_content(inp["file_path"], result)
         if name in {"skill_create", "skill_evolve"}:
             try:
                 parsed = json.loads(result)
@@ -1340,15 +1417,13 @@ class Agent:
 
     async def _execute_compact_context_tool(self, inp: dict) -> str:
         if not self.enable_folding:
-            return "Context folding is disabled for this run. Continue without compacting."
+            raise ToolFailure("Context folding is disabled for this run. Continue without compacting.")
         if self._fold_limit_reached():
-            return f"Context folding limit reached ({self.max_fold_limit}). Continue without compacting."
+            raise ToolFailure(f"Context folding limit reached ({self.max_fold_limit}). Continue without compacting.")
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
-            self._record_tool_outcome("compact_context", False)
-            return "No context compaction was performed because there is not enough conversation history yet."
-        self._record_tool_outcome("compact_context", True)
+            raise ToolFailure("No context compaction was performed because there is not enough conversation history yet.")
         self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
         return (
@@ -1363,13 +1438,13 @@ class Agent:
         result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""))
 
         if not result:
-            return f"Unknown skill: {inp.get('skill_name', '')}"
+            raise ToolFailure(f"Unknown skill: {inp.get('skill_name', '')}")
 
         #fork 表示这个 skill 不直接把 prompt 塞回当前对话，而是要启动一个子 Agent 单独完成任务。
         if result["context"] == "fork":
             budget = self._check_budget()
             if budget["exceeded"]:
-                return f"Skill fork skipped: {budget['reason']}"
+                raise ToolFailure(f"Skill fork skipped: {budget['reason']}")
             # result["allowed_tools"] - 直接访问
             tools = (
                 [t for t in self.tools if t["name"] in  result["allowed_tools"] ]
@@ -1391,6 +1466,9 @@ class Agent:
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
+                agent_role="skill-fork",
+                permitted_mcp_tools=result.get("allowed_tools"),
+                web_cache=self._web_cache,
                 confirm_fn=self.confirm_fn,
                 permission_mode=self.permission_mode,
                 max_cost_usd=(max(0.0, self.max_cost_usd - self._get_current_cost_usd())
@@ -1414,7 +1492,7 @@ class Agent:
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return f"Skill fork error: {e}"
+                raise ToolFailure(f"Skill fork error: {e}")
 
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
 
@@ -1432,7 +1510,7 @@ class Agent:
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
         if name == "exit_plan_mode":
             if self.permission_mode != "plan":
-                return "Not in plan mode."
+                raise ToolFailure("Not in plan mode.")
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
                 try:
@@ -1505,7 +1583,7 @@ class Agent:
             print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
-        return f"Unknown plan mode tool: {name}"
+        raise ToolFailure(f"Unknown plan mode tool: {name}")
 
     def _clear_history_keep_system(self) -> None:
         """清空历史信息，但是保留系统prompt."""
@@ -1523,7 +1601,7 @@ class Agent:
     async def _execute_agent_tool(self, inp:dict) -> str:
         budget = self._check_budget()
         if budget["exceeded"]:
-            return f"Sub-agent skipped: {budget['reason']}"
+            raise ToolFailure(f"Sub-agent skipped: {budget['reason']}")
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
@@ -1540,6 +1618,9 @@ class Agent:
             custom_system_prompt=config["system_prompt"],
             custom_tools=[t for t in config["tools"] if t["name"] not in {"enter_plan_mode", "exit_plan_mode"}],
             is_sub_agent=True,
+            agent_role=agent_type,
+            permitted_mcp_tools=config.get("allowed_tools"),
+            web_cache=self._web_cache,
             confirm_fn=self.confirm_fn,
             permission_mode=self.permission_mode,
             max_cost_usd=(max(0.0, self.max_cost_usd - self._get_current_cost_usd())
@@ -1563,7 +1644,7 @@ class Agent:
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
             print_sub_agent_end(agent_type, description)
-            return f"Sub-agent error: {e}"
+            raise ToolFailure(f"Sub-agent error: {e}")
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
@@ -1688,6 +1769,7 @@ class Agent:
                             "type": "tool_result",
                             "tool_use_id": tu.id,
                             "content": f"Tool execution skipped: {budget['reason']}",
+                            "is_error": True,
                         }
                         for tu in tool_uses
                     ],
@@ -1719,25 +1801,21 @@ class Agent:
                     print_info(f"Denied: {perm.get('message', '')}")
                     self._record_tool_outcome(tu.name, False)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": f"Action denied: {perm.get('message', '')}"})
+                                         "content": f"Action denied: {perm.get('message', '')}", "is_error": True})
                     continue
 
                 if perm["action"] == "confirm":
                     if not await self._confirm_tool_call(tu.name, perm):
                         self._record_tool_outcome(tu.name, False)
                         tool_results.append(
-                            {"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
+                            {"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action.", "is_error": True})
                         continue
 
                 # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
-                try:
-                    raw = await self._execute_tool_call(tu.name, inp)
-                except Exception as e:
-                    raw = f"Error executing tool: {e}"
-                raw = _safe_utf8_text(raw)
-                res = self._persist_large_result(tu.name, raw)
+                outcome = await self._execute_tool_call(tu.name, inp)
+                res = self._persist_large_result(tu.name, _safe_utf8_text(outcome.content))
                 print_tool_result(tu.name, res)
-                self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
+                self._record_tool_outcome(tu.name, outcome.ok)
 
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
@@ -1748,7 +1826,8 @@ class Agent:
                     break
 
                 # Anthropic 要求 tool_result 使用 tool_use_id 对应到前面的 tool_use block。
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                     "is_error": outcome.is_error})
 
             if not context_break and tool_results:
                 # Anthropic 要求 assistant/tool_use 后面紧跟一条 user/tool_result 消息，
@@ -1999,24 +2078,15 @@ class Agent:
                         break
 
                     if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            try:
-                                raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as e:
-                                raw = f"Error executing tool: {e}"
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
+                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool]:
+                            outcome = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                            res = self._persist_large_result(ct_item["fn"], _safe_utf8_text(outcome.content))
                             print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                            return ct_item, res, outcome.ok
 
                         results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                            )
+                        for ct_item, res, ok in results:
+                            self._record_tool_outcome(ct_item["fn"], ok)
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
@@ -2026,19 +2096,10 @@ class Agent:
                                     {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                                 continue
 
-                            try:
-                                raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as e:
-                                raw = f"Error executing tool: {e}"
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
+                            outcome = await self._execute_tool_call(ct["fn"], ct["inp"])
+                            res = self._persist_large_result(ct["fn"], _safe_utf8_text(outcome.content))
                             print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._looks_like_tool_failure(ct["fn"], raw, res),
-                            )
+                            self._record_tool_outcome(ct["fn"], outcome.ok)
 
                             if self._context_cleared:
                                 self._context_cleared = False

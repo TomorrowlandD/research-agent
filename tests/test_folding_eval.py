@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from agents.tool_result import ToolFailure
 from agents.agent import Agent
 from agents.eval_folding import _run_case, extract_answer, load_cases, main_async, score_answer, score_details, summarize
 
@@ -27,8 +28,9 @@ class FoldingSwitchTests(unittest.TestCase):
             asyncio.run(agent._check_and_compact())
             compact.assert_not_awaited()
         self.assertFalse(asyncio.run(agent._compact_conversation(trigger="manual")))
-        self.assertIn("disabled", asyncio.run(agent._execute_compact_context_tool({})))
-        self.assertIn("not available", asyncio.run(agent._execute_tool_call("compact_context", {})))
+        with self.assertRaisesRegex(ToolFailure, "disabled"):
+            asyncio.run(agent._execute_compact_context_tool({}))
+        self.assertIn("not available", asyncio.run(agent._execute_tool_call("compact_context", {})).content)
         self.assertEqual(agent._fold_count, 0)
 
     def test_enabled_folding_replaces_history_and_records_trigger(self) -> None:
@@ -61,7 +63,8 @@ class FoldingSwitchTests(unittest.TestCase):
         with patch.object(agent, "_generate_folded_session_memory", new_callable=AsyncMock, return_value={}), patch("agents.agent.save_folded_session_memory"):
             self.assertTrue(asyncio.run(agent._compact_conversation()))
             self.assertFalse(asyncio.run(agent._compact_conversation()))
-        self.assertIn("limit reached", asyncio.run(agent._execute_compact_context_tool({})))
+        with self.assertRaisesRegex(ToolFailure, "limit reached"):
+            asyncio.run(agent._execute_compact_context_tool({}))
         self.assertEqual(agent._fold_count, 1)
 
     def test_three_memories_are_independent_calls(self) -> None:

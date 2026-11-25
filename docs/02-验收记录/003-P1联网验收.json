@@ -1,0 +1,136 @@
+[
+  {
+    "case": "static",
+    "model": "deepseek-v4-pro",
+    "trace_id": "f738cb544ef44326b9b47651540e62ca",
+    "seconds": 4.665,
+    "tool_calls": 1,
+    "tools": [
+      "web_fetch"
+    ],
+    "main_tokens": {
+      "input": 9697,
+      "output": 62
+    },
+    "side_tokens": {
+      "input": 0,
+      "output": 0
+    },
+    "answer": "NL-4827",
+    "expected": "NL-4827",
+    "passed": true,
+    "spans": [
+      {
+        "timestamp": "2026-11-25T10:52:37.047145+00:00",
+        "trace_id": "f738cb544ef44326b9b47651540e62ca",
+        "span_id": "dd4a623520ed4290880a36848da997af",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "web_fetch",
+        "source_type": "builtin",
+        "latency_ms": 22.359,
+        "output_chars": 111,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      }
+    ]
+  },
+  {
+    "case": "interactive",
+    "model": "deepseek-v4-pro",
+    "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+    "seconds": 17.097,
+    "tool_calls": 5,
+    "tools": [
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_snapshot",
+      "agent"
+    ],
+    "main_tokens": {
+      "input": 23089,
+      "output": 355
+    },
+    "side_tokens": {
+      "input": 0,
+      "output": 0
+    },
+    "answer": "SW-6319",
+    "expected": "SW-6319",
+    "passed": true,
+    "spans": [
+      {
+        "timestamp": "2026-11-25T10:52:45.109570+00:00",
+        "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+        "span_id": "acedd25525044b5d99f6c2e308d1f4b8",
+        "parent_span_id": "d6246a34d38542baa38fc3ab3a0ea11e",
+        "agent_role": "explore",
+        "tool_name": "mcp__playwright__browser_navigate",
+        "source_type": "mcp",
+        "latency_ms": 282.552,
+        "output_chars": 435,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:52:47.241788+00:00",
+        "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+        "span_id": "18b9cb2d72c241eea38a730389d05bef",
+        "parent_span_id": "d6246a34d38542baa38fc3ab3a0ea11e",
+        "agent_role": "explore",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "source_type": "mcp",
+        "latency_ms": 7.659,
+        "output_chars": 330,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:52:46.156891+00:00",
+        "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+        "span_id": "9d20faa6f25e429b922f9413fce05892",
+        "parent_span_id": "d6246a34d38542baa38fc3ab3a0ea11e",
+        "agent_role": "explore",
+        "tool_name": "mcp__playwright__browser_click",
+        "source_type": "mcp",
+        "latency_ms": 1114.973,
+        "output_chars": 351,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:52:48.988806+00:00",
+        "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+        "span_id": "f637c625be2843919837a2b1195f1dca",
+        "parent_span_id": "d6246a34d38542baa38fc3ab3a0ea11e",
+        "agent_role": "explore",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "source_type": "mcp",
+        "latency_ms": 6.577,
+        "output_chars": 348,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      },
+      {
+        "timestamp": "2026-11-25T10:52:41.637785+00:00",
+        "trace_id": "2212234a3c6c458ca382b33b3e12a0b0",
+        "span_id": "d6246a34d38542baa38fc3ab3a0ea11e",
+        "parent_span_id": null,
+        "agent_role": "main",
+        "tool_name": "agent",
+        "source_type": "builtin",
+        "latency_ms": 12417.89,
+        "output_chars": 8,
+        "cache_hit": false,
+        "ok": true,
+        "error_type": null
+      }
+    ]
+  }
+]

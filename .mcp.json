@@ -1,16 +1,16 @@
 {
   "mcpServers": {
     "context7": {
-      "_comment": "原配置 command 为 npx，通常可在 macOS / Linux 使用。当前 Windows 电脑通过 Python 启动裸 npx 时会报 WinError 2，因此改为本机 npx.cmd 的绝对路径；如果 Node.js 安装位置改变，需要同步修改此路径。以下 _original_command 仅保留原值，不参与启动。",
-      "_original_command": "npx",
-      "command": "D:\\nodejs\\npx.cmd",
+      "roles": [],
+      "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"]
     },
     "playwright": {
-      "_comment": "原配置 command 为 npx，通常可在 macOS / Linux 使用。当前 Windows 电脑通过 Python 启动裸 npx 时会报 WinError 2，因此改为本机 npx.cmd 的绝对路径；如果 Node.js 安装位置改变，需要同步修改此路径。以下 _original_command 仅保留原值，不参与启动。",
-      "_original_command": "npx",
-      "command": "D:\\nodejs\\npx.cmd",
-      "args": ["@playwright/mcp@latest"]
+      "roles": ["explore"],
+      "allowed_tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+                        "browser_wait_for", "browser_navigate_back", "browser_press_key", "browser_close"],
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@0.0.86", "--headless", "--image-responses", "omit", "--isolated", "--browser", "chromium"]
     }
   }
 }

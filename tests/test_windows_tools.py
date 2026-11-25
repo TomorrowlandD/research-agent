@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from agents.tool_result import ToolFailure
 from agents.tools import _grep_search, _read_file
 
 
@@ -61,28 +62,31 @@ class WindowsReadAndSearchTests(unittest.TestCase):
         path = self.write_file("plain.txt", b"hello\n")
         self.assertEqual(_read_file({"file_path": str(path)}), "   1 | hello\n   2 | ")
         self.assertEqual(self.search("missing", path), "No matches found.")
-        self.assertTrue(self.search("hello", self.root / "missing.txt").startswith("Error searching files:"))
-        self.assertTrue(self.search("[", path).startswith("Error searching files:"))
+        with self.assertRaisesRegex(ToolFailure, "Error searching files:"):
+            self.search("hello", self.root / "missing.txt")
+        with self.assertRaisesRegex(ToolFailure, "Error searching files:"):
+            self.search("[", path)
 
     def test_invalid_encoding_is_not_silently_replaced_or_reported_as_no_match(self) -> None:
         path = self.write_file("invalid.txt", b"\xff\xfe\x80")
-        self.assertTrue(_read_file({"file_path": str(path)}).startswith("Error reading file:"))
-        result = self.search("target", path)
-        self.assertTrue(result.startswith("Error searching files:"))
-        self.assertIn(str(path), result)
+        with self.assertRaisesRegex(ToolFailure, "Error reading file:"):
+            _read_file({"file_path": str(path)})
+        with self.assertRaisesRegex(ToolFailure, "Error searching files:") as error:
+            self.search("target", path)
+        self.assertIn(str(path), str(error.exception))
 
     def test_directory_permission_error_is_not_reported_as_no_match(self) -> None:
         with patch("agents.tools.os.listdir", side_effect=PermissionError("access denied")):
-            result = self.search("target", self.root)
-        self.assertTrue(result.startswith("Error searching files:"))
-        self.assertIn("access denied", result)
+            with self.assertRaisesRegex(ToolFailure, "Error searching files:") as error:
+                self.search("target", self.root)
+        self.assertIn("access denied", str(error.exception))
 
     def test_file_permission_error_is_not_reported_as_no_match(self) -> None:
         path = self.write_file("denied.txt", b"target\n")
         with patch("agents.tools._read_tool_text", side_effect=PermissionError("access denied")):
-            result = self.search("target", path)
-        self.assertTrue(result.startswith("Error searching files:"))
-        self.assertIn("access denied", result)
+            with self.assertRaisesRegex(ToolFailure, "Error searching files:") as error:
+                self.search("target", path)
+        self.assertIn("access denied", str(error.exception))
 
     def test_partial_search_returns_matches_and_reports_unreadable_files(self) -> None:
         path = self.write_file("good.txt", b"target\n")

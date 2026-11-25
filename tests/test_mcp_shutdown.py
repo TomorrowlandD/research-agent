@@ -8,6 +8,8 @@ import time
 from contextlib import ExitStack, asynccontextmanager
 from types import SimpleNamespace
 import unittest
+
+from agents.tool_result import ToolExecutionResult
 from unittest.mock import AsyncMock, Mock, patch
 
 from agents.main import run_repl, run_one_shot
@@ -85,7 +87,7 @@ class McpShutdownTests(AsyncAuditMixin, unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(os.name == "nt", "Windows inherited-pipe cleanup")
     async def test_parent_exits_before_child_holding_pipes(self):
         async with fixture(self, "parent-exits-child-holds-pipes") as f:
-            self.assertEqual(await f.conn.call_tool("exit_server", {"delay_ms": 100}), "exiting")
+            self.assertEqual(await f.conn.call_tool("exit_server", {"delay_ms": 100}), ToolExecutionResult("exiting"))
             await eventually(lambda: any(row["role"] == "parent_pid" and row["exited"] for row in f.owned.states()))
             rows = f.owned.states()
             self.assertTrue(any(row["role"] == "child_pid" and not row["exited"] for row in rows))
@@ -139,7 +141,7 @@ class McpShutdownTests(AsyncAuditMixin, unittest.IsolatedAsyncioTestCase):
                             await manager.load_and_connect()
                             await good.capture()
                             self.assertEqual(list(manager._connections), ["good"])
-                            self.assertEqual(await manager.call_tool("mcp__good__echo", {"text": mode}), mode)
+                            self.assertEqual(await manager.call_tool("mcp__good__echo", {"text": mode}), ToolExecutionResult(mode))
                             self.assertEqual(len(manager.get_tool_definitions()), 8)
                             expected = ["initialize"] + (["list_tools"] if mode.startswith("list") else []) + ["initialize", "list_tools"]
                             self.assertEqual([name for name, timeout in calls], expected)

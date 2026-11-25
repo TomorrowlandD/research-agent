@@ -5,6 +5,8 @@ import json
 import os
 from types import SimpleNamespace
 import unittest
+
+from agents.tool_result import ToolExecutionResult
 from unittest.mock import AsyncMock, patch
 
 from agents.agent import Agent
@@ -146,7 +148,7 @@ class DeepSeekConfigTests(unittest.TestCase):
             response_stream("Done"), response_stream("Follow-up"),
         ]
         with (
-            patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value="mock tool result") as execute,
+            patch.object(agent, "_execute_tool_call", new_callable=AsyncMock, return_value=ToolExecutionResult("mock tool result")) as execute,
             patch.object(agent, "_emit_text"),
             patch("agents.agent.check_permission", return_value={"action": "allow"}),
             patch("agents.agent.start_spinner"), patch("agents.agent.stop_spinner"),

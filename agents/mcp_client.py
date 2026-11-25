@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -43,40 +45,45 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, Implementation, REQUEST_TIMEOUT, TextContent
 
+from .tool_result import ToolExecutionResult
 from .ui import print_error, print_info
 
 MCP_TOOL_TIMEOUT_SECONDS = 60.0
+MCP_CONNECT_TIMEOUT_SECONDS = 20.0
 MCP_CLOSE_TIMEOUT_SECONDS = 15.0
+MCP_CLEANUP_DEADLINE_SECONDS = 30.0
 
 
 # ─── 单个 MCP 连接：一个 McpConnection 对应一个 MCP Server 子进程 ──────────────────
 
 
-async def _await_cleanup(future: asyncio.Future) -> Any:
-    """Drain owned cleanup even if the caller is cancelled (including twice).
-
-    The observation budget never cancels the resource owner. If exceeded, keep
-    draining, then report failure; the test process supplies the hard deadline.
-    """
+async def _await_cleanup(future: asyncio.Future, *, started: float | None = None) -> Any:
+    """Wait across caller cancellations, bounded by a single monotonic deadline."""
     cancelled = None
     overdue = False
-    deadline = asyncio.get_running_loop().time() + MCP_CLOSE_TIMEOUT_SECONDS
+    clock = asyncio.get_running_loop().time
+    start = clock() if started is None else started
     while not future.done():
-        try:
+        budget = MCP_CLEANUP_DEADLINE_SECONDS if overdue else min(
+            MCP_CLOSE_TIMEOUT_SECONDS, MCP_CLEANUP_DEADLINE_SECONDS
+        )
+        remaining = start + budget - clock()
+        if remaining <= 0:
             if overdue:
-                await asyncio.shield(future)
-            else:
-                remaining = max(0, deadline - asyncio.get_running_loop().time())
-                await asyncio.wait_for(asyncio.shield(future), remaining)
-        except asyncio.CancelledError as exc:
-            cancelled = exc
-        except TimeoutError:
-            if future.done():
-                break
+                message = f"MCP cleanup hard deadline exceeded ({budget:g} seconds)"
+                print_error(message)
+                # The SDK owner still owns its context managers and may exit later.
+                future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                if cancelled is not None:
+                    raise cancelled
+                raise TimeoutError(message)
             overdue = True
             print_error(f"MCP cleanup exceeded {MCP_CLOSE_TIMEOUT_SECONDS:g} seconds; still waiting for resource owner")
-        except Exception:
-            break  # Retrieve the completed future's exception below.
+            continue
+        try:
+            await asyncio.wait({future}, timeout=remaining)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
     try:
         result = future.result()
     except BaseException as exc:
@@ -112,6 +119,7 @@ class McpConnection:
         self._ready: asyncio.Future | None = None
         self._stop: asyncio.Event | None = None
         self._closing = False
+        self._close_started: float | None = None
         self._was_ready = False
         self._owner_error: BaseException | None = None
 
@@ -124,7 +132,11 @@ class McpConnection:
             self._stop = asyncio.Event()
             self._owner_task = asyncio.create_task(self._run_owner(), name=f"mcp-owner:{self.server_name}")
         try:
-            await asyncio.shield(self._ready)
+            await asyncio.wait_for(asyncio.shield(self._ready), MCP_CONNECT_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            await self.close()
+            raise TimeoutError(f"MCP server '{self.server_name}' connect timed out after "
+                               f"{MCP_CONNECT_TIMEOUT_SECONDS:g} seconds") from exc
         except asyncio.CancelledError:
             try:
                 await self.close()
@@ -140,9 +152,17 @@ class McpConnection:
                 return
             with anyio.CancelScope() as scope:
                 self._owner_scope = scope
-                params = StdioServerParameters(command=self.command, args=self.args,
-                                               env={**os.environ, **self.env})
-                with open(os.devnull, "w", encoding="utf-8") as errlog:
+                env = {**os.environ, **self.env}
+                command = self.command
+                if not os.path.isabs(command):
+                    command = shutil.which(command, path=env.get("PATH"))
+                    if command is None:
+                        raise FileNotFoundError(f"Command not found: {self.command}")
+                params = StdioServerParameters(command=command, args=self.args, env=env)
+                log_dir = Path.home() / RESEARCH_DIRNAME / "logs"
+                log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                log_path = log_dir / f"mcp-{quote(self.server_name, safe='')}.stderr.log"
+                with log_path.open("a", encoding="utf-8") as errlog:
                     async with stdio_client(params, errlog=errlog) as (read, write):
                         async with ClientSession(read, write, read_timeout_seconds=None,
                                                  client_info=Implementation(name="mini-claude", version="1.0.0")) as session:
@@ -196,26 +216,28 @@ class McpConnection:
                 for tool in result.tools
             ]
 
-    async def call_tool(self, name: str, args: dict) -> str:
+    async def call_tool(self, name: str, args: dict) -> ToolExecutionResult:
         async with self._operation(f"call_tool '{name}'") as session:
             result = await session.call_tool(name, arguments=args)
             if not isinstance(result, CallToolResult):
                 raise TypeError(f"Unexpected tool result: {type(result).__name__}")
             text = "\n".join(block.text for block in result.content if isinstance(block, TextContent))
             if result.is_error:
-                raise RuntimeError(text or "Tool reported failure without text")
-            return text
+                return ToolExecutionResult.failure(text or "Tool reported failure without text", "mcp_tool_error")
+            return ToolExecutionResult(text)
 
     async def close(self) -> None:
         """Signal the owner, then wait for actual completion across cancellation."""
         self._closing = True
         if self._owner_task is None:
             return
+        if self._close_started is None:
+            self._close_started = asyncio.get_running_loop().time()
         self._stop.set()
         if not self._ready.done() and self._owner_scope is not None:
             # Only cancel the startup scope; never Task.cancel() SDK teardown.
             self._owner_scope.cancel()
-        await _await_cleanup(self._owner_task)
+        await _await_cleanup(self._owner_task, started=self._close_started)
         if self._was_ready and self._owner_error is not None:
             raise RuntimeError(f"MCP server '{self.server_name}' lifecycle failed: {_error_text(self._owner_error)}") from self._owner_error
 
@@ -236,16 +258,19 @@ class McpManager:
     def __init__(self):
         # 已连接的 MCP Server。key 是 server name，value 是对应连接对象。
         self._connections: dict[str, McpConnection] = {}
+        self._role = "main"
+        self._allowed: dict[str, set[str]] = {}
         # 所有 MCP Server 发现出来的工具定义，保持接近 MCP 原始格式。
         self._tools: list[dict] = []
         # 防止重复连接。load_and_connect() 只应真正执行一次。
         self._connected = False
 
-    async def load_and_connect(self) -> None:
+    async def load_and_connect(self, role: str = "main", *, permitted_tools: set[str] | None = None) -> None:
         """读取配置，连接所有配置的 MCP Server，并发现它们提供的工具。"""
         if self._connected:
             return
         self._connected = True
+        self._role = role
 
         # 合并全局、项目和 .mcp.json 配置。后读取的配置会覆盖同名 Server。
         configs = self._load_configs()
@@ -256,6 +281,20 @@ class McpManager:
         timeout = 15.0
 
         for name, cfg in configs.items():
+            roles = cfg.get("roles", ["main"])
+            allowed = cfg.get("allowed_tools")
+            if any(key in cfg and (not isinstance(cfg[key], list) or
+                   not all(isinstance(item, str) for item in cfg[key])) for key in ("roles", "allowed_tools")):
+                print_error(f"Invalid roles/allowed_tools for MCP server {name}")
+                continue
+            if role not in roles:
+                continue
+            if permitted_tools is not None:
+                prefix = f"mcp__{name}__"
+                permitted = {tool[len(prefix):] for tool in permitted_tools if tool.startswith(prefix)}
+                allowed = permitted if allowed is None else permitted.intersection(allowed)
+            if allowed is not None and not allowed:
+                continue
             # 根据配置创建一个独立连接对象。
             conn = McpConnection(
                 name,
@@ -269,6 +308,9 @@ class McpManager:
                 await asyncio.wait_for(conn.initialize(), timeout=timeout)
                 server_tools = await asyncio.wait_for(conn.list_tools(), timeout=timeout)
                 # 只有初始化和工具发现都成功，才登记为可用连接。
+                if allowed is not None:
+                    server_tools = [tool for tool in server_tools if tool["name"] in allowed]
+                    self._allowed[name] = {tool["name"] for tool in server_tools}
                 self._connections[name] = conn
                 self._tools.extend(server_tools)
                 print_info(f"MCP connected: {name} ({len(server_tools)} tools)")
@@ -288,8 +330,10 @@ class McpManager:
         except Exception as exc:
             print_error(f"MCP cleanup failed: {conn.server_name}: {exc}")
 
-    def get_tool_definitions(self) -> list[dict]:
+    def get_tool_definitions(self, role: str | None = None) -> list[dict]:
         """返回 Agent/Anthropic 可直接使用的工具定义，并给 MCP 工具名加前缀。"""
+        if role is not None and role != self._role:
+            return []
         return [
             {
                 # 前缀格式：mcp__服务名__工具名。
@@ -306,7 +350,7 @@ class McpManager:
         """判断一个工具名是否是 MCP 工具名。"""
         return name.startswith("mcp__")
 
-    async def call_tool(self, prefixed_name: str, args: dict) -> str:
+    async def call_tool(self, prefixed_name: str, args: dict) -> ToolExecutionResult:
         """把带前缀的 MCP 工具调用路由到正确的 MCP Server。"""
         # 工具名格式为 mcp__serverName__toolName。
         parts = prefixed_name.split("__")
@@ -318,6 +362,8 @@ class McpManager:
         conn = self._connections.get(server_name)
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
+        if server_name in self._allowed and tool_name not in self._allowed[server_name]:
+            raise ValueError(f"Tool is not allowed for {self._role}: {prefixed_name}")
         try:
             return await asyncio.wait_for(
                 conn.call_tool(tool_name, args), timeout=MCP_TOOL_TIMEOUT_SECONDS
@@ -331,6 +377,7 @@ class McpManager:
         """断开所有 MCP Server 连接，并清空工具缓存。"""
         connections = list(self._connections.values())
         self._connections.clear()
+        self._allowed.clear()
         self._tools.clear()
         self._connected = False
         # 并行清理，单个连接出错也不跳过其他连接。
@@ -375,6 +422,9 @@ class McpManager:
             # 2. {"name": {...}}
             servers = raw.get("mcpServers", raw)
             for name, config in servers.items():
+                if "__" in name or not name:
+                    print_error(f"Invalid MCP server name in {path}: {name!r}")
+                    continue
                 # 只接收包含 command 的对象；无效配置直接忽略。
                 if isinstance(config, dict) and "command" in config:
                     target[name] = config
