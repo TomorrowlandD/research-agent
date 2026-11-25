@@ -1,18 +1,18 @@
 # 003 ResearchAgent 联网能力与 MCP 演进验收记录
 
-2026-11-25 · WSL Ubuntu · P0、P1、P2.1、P2.2 和 P2.3a 已验收，P1 搜索服务商实网调用待补证
+2026-11-25 · WSL Ubuntu · P0、P1、P2.1、P2.2、P2.3a 和 P2.3b 已验收，P1 搜索服务商实网调用待补证
 
 [对应技术方案（03）](<../01-技术方案改造/03-ResearchAgent 联网能力与 MCP 演进技术方案文档.md>)
 
 ## 分阶段验收
 
-P0、P1、P2.1、P2.2 和 P2.3a 的执行条件、实测数据及验证范围见下文。
+P0、P1、P2.1、P2.2、P2.3a 和 P2.3b 的执行条件、实测数据及验证范围见下文。
 
 | 阶段 | 验收条件 | 状态 |
 | --- | --- | --- |
 | P0 基础建设与基线 | 在 WSL/Linux 验证 Playwright 启动、连接与清理超时、错误透传和 JSONL Trace。运行 MCP 回归测试，并保留同一组基线任务的耗时、工具调用次数及 Token 用量。 | 已验收，2026-11-25 |
 | P1 联网能力与角色隔离 | 常规查询通过内置搜索和抓取完成；交互页面可委派给仅挂载白名单浏览器工具的 `explore`。验证重复只读查询命中缓存，并核对缓存与 Trace 的实现位置。 | WSL 通过；搜索服务商仅完成离线接口测试 |
-| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | P2.1 录制、P2.2 单次工具回放和 P2.3a 静态整轮回放通过，下一项 P2.3b |
+| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | P2.1 录制、P2.2 工具回放和 P2.3a/b 两种整轮回放通过，下一项 P2.4 |
 | P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | 待验收 |
 
 ## 实际验收记录
@@ -107,6 +107,25 @@ python -s -B -m unittest discover -s tests -v
 ```
 
 [随仓录制样本](../../tests/fixtures/static_task_replay.json)的 SHA-256 为 `d97852d40484e41bcb011b8b05bd44ce02310caba82d6ccb7642b3de4ab9e8a0`。下一项 P2.3b 验证主 Agent 委派、点击前后的页面状态和离线浏览器启动次数。P2.4 性能评测继续使用同条件实测数据。
+
+### P2.3b · 交互任务整轮回放 · 2026-11-25
+
+WSL Ubuntu 24.04.1、Python 3.11.18、Linux Node 26.13.1、Playwright MCP 0.0.86。使用 P0/P1 原动态页面及点击题。主 Agent 收到固定委派提示，真实创建 `explore`。录制时 Chromium 使用用户缓存和临时解包的 libnspr4、libnss3、libasound2t64。
+
+| 检查 | 实测结果 |
+| --- | --- |
+| 在线录制 | DeepSeek 共 7 轮响应（main 2、explore 5）。JSONL 中 1 条 main 委派，4 条 explore 调用共享其父 span。浏览器操作为导航、读快照、点击、再读快照。两次 `browser_snapshot` 参数均为 `{}`。点击前有 Show result 按钮，点击后才有 `SW-6319`。 |
+| 断网回放 | 在新进程、空工作区及无网络命名空间重跑。主、子 Agent 均经过运行时循环，按序消费浏览器调用记录，并对每轮模型输入校验摘要。最终编号 `SW-6319`。上游 HTTP 请求 0，浏览器及 MCP 子进程启动 0。进程守卫允许 SDK 的 `uname -p` 平台查询。 |
+| 反向验证与回归 | 交换两次同名同参快照的结果，回放因模型输入摘要不符退出。静态及交互专项合计 4 项通过。完整回归 112 项，109 通过、3 项 Windows 专用用例跳过。 |
+
+```bash
+PYTHONPATH=. python -s -B tests/fixtures/interactive_task_replay.py record /tmp/researchagent-interactive.json
+unshare --user --map-root-user --net -- env PYTHONPATH=. python -s -B tests/fixtures/interactive_task_replay.py replay tests/fixtures/interactive_task_replay.json
+unshare --user --map-root-user --net -- python -s -B -m unittest discover -s tests -p 'test_static_task_replay.py' -v
+python -s -B -m unittest discover -s tests -v
+```
+
+[交互录制样本](../../tests/fixtures/interactive_task_replay.json)。本次真实模型验收使用 DeepSeek 的 OpenAI 兼容协议。
 
 ## 后续待验收与 Agent 交接
 

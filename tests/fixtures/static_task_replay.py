@@ -36,6 +36,25 @@ def live_config():
     return profile, {"api_key": key, "api_base" if openai else "anthropic_base_url": base}
 
 
+async def model_exchange(turns, index, replay, send, request, kwargs):
+    payload = json.loads(request.content)
+    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    if replay:
+        if index >= len(turns):
+            raise ValueError(f"Missing recorded model response for turn {index + 1}")
+        turn = turns[index]
+        if digest != turn["request_sha256"]:
+            raise ValueError(f"Model input differs from recording at turn {index + 1}")
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=turn["response_sse"], request=request)
+    response = await send(request, **kwargs)
+    response.raise_for_status()
+    await response.aread()
+    turns.append({"request_sha256": digest, "response_sse": response.text})
+    return response
+
+
 async def run_static(bundle, options, home, *, replay):
     profile = bundle["profile"]
     agent = Agent(model=profile["model"], **options, custom_system_prompt=SYSTEM,
@@ -54,27 +73,12 @@ async def run_static(bundle, options, home, *, replay):
     roles = []
 
     async def model_turn(request, **kwargs):
-        payload = json.loads(request.content)
-        canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(canonical.encode()).hexdigest()
         index = len(roles)
         sequence.append("model")
-        roles.append(payload["messages"][-1]["role"])
+        roles.append(json.loads(request.content)["messages"][-1]["role"])
         if index >= 2:
             raise ValueError("Static task called the model more than twice")
-        if replay:
-            if index >= len(bundle["turns"]):
-                raise ValueError(f"Missing recorded model response for turn {index + 1}")
-            turn = bundle["turns"][index]
-            if digest != turn["request_sha256"]:
-                raise ValueError(f"Model input differs from recording at turn {index + 1}")
-            return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                                  content=turn["response_sse"], request=request)
-        response = await send(request, **kwargs)
-        response.raise_for_status()
-        await response.aread()
-        bundle["turns"].append({"request_sha256": digest, "response_sse": response.text})
-        return response
+        return await model_exchange(bundle["turns"], index, replay, send, request, kwargs)
 
     try:
         with (patch.object(sdk._client, "send", model_turn),

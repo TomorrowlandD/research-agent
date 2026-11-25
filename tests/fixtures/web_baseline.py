@@ -36,6 +36,14 @@ def case_prompt(case, port):
     return f"{question} 使用网页工具核实，只回答编号。http://127.0.0.1:{port}/{path}"
 
 
+def write_interactive_page(pages):
+    (pages / "results.html").write_text(
+        "<h1>Observation results</h1><button onclick=\"fetch('sample.txt').then(r => r.text())"
+        ".then(t => document.querySelector('output').textContent=t)\">Show result</button><output></output>"
+    )
+    (pages / "sample.txt").write_text("SW-6319")
+
+
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -100,11 +108,7 @@ async def main(output):
         pages = root / "pages"
         pages.mkdir()
         (pages / "catalog.html").write_text(STATIC_PAGE)
-        (pages / "results.html").write_text(
-            "<h1>Observation results</h1><button onclick=\"fetch('sample.txt').then(r => r.text())"
-            ".then(t => document.querySelector('output').textContent=t)\">Show result</button><output></output>"
-        )
-        (pages / "sample.txt").write_text("SW-6319")
+        write_interactive_page(pages)
         handler = partial(QuietHandler, directory=str(pages))
         with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
