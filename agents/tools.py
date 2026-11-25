@@ -276,16 +276,15 @@ tool_definitions: list[ToolDef] = [
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
     path = Path(raw_path)
-    if path.exists() or not path.is_absolute():
+    # For writes, use the path shown in the approval, including new directories.
+    if not must_exist or path.exists() or not path.is_absolute():
         return path
 
     parts = path.parts
     cwd = Path.cwd()
     for i in range(1, len(parts)):
         candidate = cwd.joinpath(*parts[i:])
-        if must_exist and candidate.exists():
-            return candidate
-        if not must_exist and candidate.parent.exists():
+        if candidate.exists():
             return candidate
 
     return path

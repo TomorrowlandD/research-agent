@@ -167,6 +167,7 @@ class Agent:
                  max_turns: int | None=None,
                  max_output_tokens: int | None=None,
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
+                 output_fn: Callable[[str], Awaitable[None]] | None = None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
                  is_sub_agent: bool=False,
@@ -239,6 +240,7 @@ class Agent:
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
         self.confirm_fn = confirm_fn
+        self.output_fn = output_fn
         self._custom_system_prompt = custom_system_prompt
         self.effective_window = (CONTEXT_WINDOW - max_output_tokens - 20000
                                  if self._deepseek else _get_context_windows(model) - 20000)
@@ -645,14 +647,16 @@ class Agent:
 
     #输出工具：统一处理模型输出文本。根据当前是否处于“收集输出”的模式
     # 决定是把文本存进缓冲区，还是直接打印到终端。
-    def _emit_text(self, text:str)->None:
+    async def _emit_text(self, text: str, *, thinking: bool = False) -> None:
         text = _safe_utf8_text(text)
         if self._turn_output_buffer is not None:
             self._turn_output_buffer.append(text)
         if self._output_buffer is not None:
             self._output_buffer.append(text)
-        else:
+        elif self.output_fn is None:
             print_assistant_text(text)
+        if self.output_fn is not None and not thinking:
+            await self.output_fn(text)
 
     def _build_fold_guidance_section(self) -> str:
         if self._custom_system_prompt is not None or not self.enable_folding:
@@ -1904,15 +1908,15 @@ class Agent:
                             block.text += delta.text
                             if first_text:
                                 stop_spinner()
-                                self._emit_text("\n")
+                                await self._emit_text("\n")
                                 first_text = False
-                            self._emit_text(delta.text)
+                            await self._emit_text(delta.text)
                         elif hasattr(delta, "thinking"):
                             if first_text:
                                 stop_spinner()
-                                self._emit_text("\n  [thinking] ")
+                                await self._emit_text("\n  [thinking] ", thinking=True)
                                 first_text = False
-                            self._emit_text(delta.thinking)
+                            await self._emit_text(delta.thinking, thinking=True)
                         elif hasattr(delta, "partial_json") and block.type == "tool_use":
                             if not block.input_is_json:
                                 block.input = ""
@@ -2197,9 +2201,9 @@ class Agent:
                     if delta and delta.content:
                         if first_text:
                             stop_spinner()
-                            self._emit_text("\n")
+                            await self._emit_text("\n")
                             first_text = False
-                        self._emit_text(delta.content)
+                        await self._emit_text(delta.content)
                         content += _safe_utf8_text(delta.content)
 
                     if delta and delta.tool_calls:
