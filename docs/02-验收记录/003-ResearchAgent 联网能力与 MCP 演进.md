@@ -1,18 +1,18 @@
 # 003 ResearchAgent 联网能力与 MCP 演进验收记录
 
-2026-11-25 · WSL Ubuntu · P0、P1、P2.1、P2.2、P2.3a 和 P2.3b 已验收，P1 搜索服务商实网调用待补证
+2026-11-25 · WSL Ubuntu · P0、P1、P2 已验收，P1 搜索服务商实网调用待补证
 
 [对应技术方案（03）](<../01-技术方案改造/03-ResearchAgent 联网能力与 MCP 演进技术方案文档.md>)
 
 ## 分阶段验收
 
-P0、P1、P2.1、P2.2、P2.3a 和 P2.3b 的执行条件、实测数据及验证范围见下文。
+P0、P1 和 P2 各子阶段的执行条件、实测数据及验证范围见下文。
 
 | 阶段 | 验收条件 | 状态 |
 | --- | --- | --- |
 | P0 基础建设与基线 | 在 WSL/Linux 验证 Playwright 启动、连接与清理超时、错误透传和 JSONL Trace。运行 MCP 回归测试，并保留同一组基线任务的耗时、工具调用次数及 Token 用量。 | 已验收，2026-11-25 |
 | P1 联网能力与角色隔离 | 常规查询通过内置搜索和抓取完成；交互页面可委派给仅挂载白名单浏览器工具的 `explore`。验证重复只读查询命中缓存，并核对缓存与 Trace 的实现位置。 | WSL 通过；搜索服务商仅完成离线接口测试 |
-| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | P2.1 录制、P2.2 工具回放和 P2.3a/b 两种整轮回放通过，下一项 P2.4 |
+| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | 已验收。静态与交互整轮断网回放、10 轮配对量化对照通过 |
 | P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | 待验收 |
 
 ## 实际验收记录
@@ -126,6 +126,26 @@ python -s -B -m unittest discover -s tests -v
 ```
 
 [交互录制样本](../../tests/fixtures/interactive_task_replay.json)。本次真实模型验收使用 DeepSeek 的 OpenAI 兼容协议。
+
+### P2.4 · 联网量化对照 · 2026-11-25
+
+在 P2.3b 验收提交 `d6286bc` 之后启动量化实验。WSL Ubuntu 24.04.1、Python 3.11.18、Node 26.13.1、Playwright MCP 0.0.86、MCP SDK 2.3.0、DeepSeek V4 Pro。固定页面、提示、模型和轮数上限一致。历史 P0 工作区未单独提交，新增 P0 组按 `8702527` 的运行时源码及锁定的 Linux 浏览器配置重建主 Agent 浏览器路径，P1 组使用 `3a999e5`。历史两组每题各一次的测量独立列示。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 同题配对 | 10 轮、每轮两个任务和两种路径，共 40 次。每题每组 n=10；成功率、P50/P95、平均调用数、平均输入／输出 Token 已从逐次数据重算。 |
+| 静态任务 | 两组均 10/10。P0 → P1 的 P50 为 8.314 → 4.145 秒，平均输入 Token 为 34,770.5 → 9,654.5。 |
+| 动态任务 | P0 为 10/10，P1 为 9/10。P50 为 13.845 → 17.743 秒。P1 第 10 轮工具全部成功，最终答复为 `6319`，预期为 `SW-6319`。该次计入全部指标。 |
+| 独立复核 | 逐项核对历史数据、40 条新记录及 20 对执行顺序。独立计算四组时延分位数，重新生成的报告字节一致。统计专项 3 项通过；完整回归 115 项，112 通过、3 项 Windows 专用用例跳过。 |
+
+```bash
+PYTHONPATH=. python -s -B tests/fixtures/web_comparison.py collect /tmp/researchagent-comparison.jsonl --rounds 10
+python -s -B tests/fixtures/web_comparison_report.py 'docs/02-验收记录/003-P2.4配对实测.jsonl' --output /tmp/researchagent-comparison.md
+python -s -B -m unittest discover -s tests -p 'test_web_comparison_report.py' -v
+python -s -B -m unittest discover -s tests -v
+```
+
+[完整量化报告](003-P2.4联网量化对照.md) · [逐次原始记录](003-P2.4配对实测.jsonl)。P2 里程碑完成，下一项为 P3.1 Web 会话与审批。P1 的真实搜索服务补证仍待密钥。
 
 ## 后续待验收与 Agent 交接
 
