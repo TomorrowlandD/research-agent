@@ -1,18 +1,18 @@
 # 003 ResearchAgent 联网能力与 MCP 演进验收记录
 
-2026-11-25 · WSL Ubuntu · P0、P1、P2.1 和 P2.2 已验收，P1 搜索服务商实网调用待补证
+2026-11-25 · WSL Ubuntu · P0、P1、P2.1、P2.2 和 P2.3a 已验收，P1 搜索服务商实网调用待补证
 
 [对应技术方案（03）](<../01-技术方案改造/03-ResearchAgent 联网能力与 MCP 演进技术方案文档.md>)
 
 ## 分阶段验收
 
-P0、P1、P2.1 和 P2.2 的执行条件、实测数据及验证范围见下文。
+P0、P1、P2.1、P2.2 和 P2.3a 的执行条件、实测数据及验证范围见下文。
 
 | 阶段 | 验收条件 | 状态 |
 | --- | --- | --- |
 | P0 基础建设与基线 | 在 WSL/Linux 验证 Playwright 启动、连接与清理超时、错误透传和 JSONL Trace。运行 MCP 回归测试，并保留同一组基线任务的耗时、工具调用次数及 Token 用量。 | 已验收，2026-11-25 |
 | P1 联网能力与角色隔离 | 常规查询通过内置搜索和抓取完成；交互页面可委派给仅挂载白名单浏览器工具的 `explore`。验证重复只读查询命中缓存，并核对缓存与 Trace 的实现位置。 | WSL 通过；搜索服务商仅完成离线接口测试 |
-| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | P2.1 录制、P2.2 单次工具回放通过，下一项 P2.3a |
+| P2 离线评测与对照 | 验证断网且零 API 消耗时的回放结果。用相同任务对比 P0 与 P1 的成功率、P50/P95 时延、平均工具调用次数和上下文 Token 用量。 | P2.1 录制、P2.2 单次工具回放和 P2.3a 静态整轮回放通过，下一项 P2.3b |
 | P3 Web 接入与会话回收 | 验证多标签页并发及异常关闭后的闲置进程回收，检查前端能否追溯主、子 Agent 调用链。Streamable HTTP 按高并发部署需求单独记录。 | 待验收 |
 
 ## 实际验收记录
@@ -86,6 +86,27 @@ WSL Ubuntu，项目 `researchAgent` Python 3.11 环境。默认 `live` 模式不
 | 完整离线回归 | `python -s -B -m unittest discover -s tests -v` | 共 108 项，105 通过，3 项 Windows 专用用例跳过。 |
 
 本次专项未调用模型或真实搜索服务。模型响应与静态整轮任务回放由 P2.3a 验收。P1 搜索实网联调仍待密钥补证。
+
+### P2.3a · 静态任务整轮回放 · 2026-11-25
+
+WSL Ubuntu，Conda `researchAgent`，Python 3.11.18，代码基底 `aea08f1`。沿用 P0/P1 的 North Lake 页面、问题和预期编号。在临时用户目录及工作区中运行 `Agent.run_once()`，固定系统提示，只开放 `web_fetch`，关闭 MCP、折叠、记忆预取和在线技能演化。本项验收覆盖 DeepSeek 的 OpenAI 兼容协议。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 在线录制 | 正式样本包含 `deepseek-v4-pro` 的两轮流式响应、各轮模型请求正文的 SHA-256，以及一份完整的 P2.1 工具快照。固定页面服务收到 1 次 GET。最终编号为 `NL-4827`。 |
+| 独立进程断网回放 | 录制结束后页面服务退出。使用新用户目录、空缓存、占位密钥，在独立网络命名空间运行（仅有 `lo` 且为 DOWN）。SDK 解析已录响应，工具经过 P2.2 回放。实测事件顺序与录制一致，均为 模型 → `web_fetch` → 模型，最终编号均为 `NL-4827`。上游 HTTP 传输调用共 0 次，含模型 API 和网页服务。终端显示的 Token 为录制时的响应计量。 |
+| 输入一致性与完整回归 | 篡改录制的网页正文后，第二轮模型请求摘要校验失败，进程以非零状态退出。无网专项 2 项通过。完整离线回归 110 项，107 通过、3 项 Windows 专用用例跳过。 |
+
+在仓库根目录激活项目 Python 环境后可复跑。录制命令使用新的输出文件，随仓样本可直接离线回放。
+
+```bash
+PYTHONPATH=. python -s -B tests/fixtures/static_task_replay.py record /tmp/researchagent-static.json
+unshare --user --map-root-user --net -- env PYTHONPATH=. python -s -B tests/fixtures/static_task_replay.py replay tests/fixtures/static_task_replay.json
+unshare --user --map-root-user --net -- python -s -B -m unittest discover -s tests -p 'test_static_task_replay.py' -v
+python -s -B -m unittest discover -s tests -v
+```
+
+[随仓录制样本](../../tests/fixtures/static_task_replay.json)的 SHA-256 为 `d97852d40484e41bcb011b8b05bd44ce02310caba82d6ccb7642b3de4ab9e8a0`。下一项 P2.3b 验证主 Agent 委派、点击前后的页面状态和离线浏览器启动次数。P2.4 性能评测继续使用同条件实测数据。
 
 ## 后续待验收与 Agent 交接
 

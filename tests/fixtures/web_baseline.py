@@ -28,6 +28,14 @@ CASES = [
 ]
 
 
+STATIC_PAGE = "<h1>Observation catalog</h1><p>North Lake: NL-4827</p>"
+
+
+def case_prompt(case, port):
+    _, path, question, _ = case
+    return f"{question} 使用网页工具核实，只回答编号。http://127.0.0.1:{port}/{path}"
+
+
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -41,12 +49,12 @@ async def approve(message):
 
 
 async def run_case(case, port, model, api_options):
-    label, path, question, expected = case
+    label, _, _, expected = case
     agent = Agent(
         model=model, **api_options, confirm_fn=approve, max_turns=8, max_output_tokens=1500,
         enable_memory_prefetch=False, enable_online_evolution=False, enable_folding=False,
     )
-    prompt = f"{question} 使用网页工具核实，只回答编号。http://127.0.0.1:{port}/{path}"
+    prompt = case_prompt(case, port)
     start = time.monotonic()
     try:
         result = await agent.run_once(prompt)
@@ -91,7 +99,7 @@ async def main(output):
         shutil.copyfile(repo / ".mcp.json", work / ".mcp.json")
         pages = root / "pages"
         pages.mkdir()
-        (pages / "catalog.html").write_text("<h1>Observation catalog</h1><p>North Lake: NL-4827</p>")
+        (pages / "catalog.html").write_text(STATIC_PAGE)
         (pages / "results.html").write_text(
             "<h1>Observation results</h1><button onclick=\"fetch('sample.txt').then(r => r.text())"
             ".then(t => document.querySelector('output').textContent=t)\">Show result</button><output></output>"
