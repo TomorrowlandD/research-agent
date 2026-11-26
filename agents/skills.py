@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 from typing import Any
 
 from .frontmatter import parse_frontmatter
@@ -89,7 +89,7 @@ def discover_skills() -> list[SkillDefinition]:
     user_dir = Path.home() / RESEARCH_DIRNAME / "skills"
     _load_skills_from_dir(user_dir, "user", skills)
     # 项目级 skills 优先级较低：<cwd>/.research/skills/<name>/SKILL.md
-    project_dir = Path.cwd() / RESEARCH_DIRNAME / "skills"
+    project_dir = workspace_dir() / RESEARCH_DIRNAME / "skills"
     _load_skills_from_dir(project_dir, "project", skills, overwrite=False)
 
     _cached_skills = list(skills.values())

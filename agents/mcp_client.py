@@ -36,7 +36,7 @@ from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 from typing import Any
 
 import anyio
@@ -401,11 +401,11 @@ class McpManager:
         self._merge_config_file(global_path, merged)
 
         # 2. 当前项目配置：<cwd>/.research/settings.json
-        project_path = Path.cwd() / RESEARCH_DIRNAME / "settings.json"
+        project_path = workspace_dir() / RESEARCH_DIRNAME / "settings.json"
         self._merge_config_file(project_path, merged)
 
         # 3. Claude Code 约定配置：<cwd>/.mcp.json
-        mcp_json_path = Path.cwd() / ".mcp.json"
+        mcp_json_path = workspace_dir() / ".mcp.json"
         self._merge_config_file(mcp_json_path, merged)
 
         return merged

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 
 from .frontmatter import parse_frontmatter
 from .tools import tool_definitions, ToolDef
@@ -98,7 +98,7 @@ def _discover_custom_agents() -> dict[str, dict]:
     # User-level (lower priority)
     _load_agents_from_dir(Path.home() / RESEARCH_DIRNAME / "agents", agents)
     # Project-level (higher priority, overwrites)
-    _load_agents_from_dir(Path.cwd() / RESEARCH_DIRNAME / "agents", agents)
+    _load_agents_from_dir(workspace_dir() / RESEARCH_DIRNAME / "agents", agents)
 
     _cached_custom_agents = agents
     return agents

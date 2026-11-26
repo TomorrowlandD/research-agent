@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 from typing import Any
 
 from .frontmatter import parse_frontmatter, format_frontmatter
@@ -51,7 +51,7 @@ class MemoryEntry:
 
 def _project_hash() -> str:
     """用当前工作目录生成稳定 hash，让不同项目的记忆互相隔离。"""
-    return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
+    return hashlib.sha256(str(workspace_dir()).encode()).hexdigest()[:16]
 
 
 def get_memory_dir() -> Path:

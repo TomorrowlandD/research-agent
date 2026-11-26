@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "researchagent"
+version = "0.1.0"
+description = "Agent runtime for long-running research tasks"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+researchagent = "agents.main:cli_main"
+
+[tool.setuptools]
+packages = ["agents"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.package-data]
+agents = ["web_ui/*.html", "web_ui/*.js", "web_ui/*.css"]

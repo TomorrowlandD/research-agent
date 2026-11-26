@@ -7,9 +7,12 @@ import asyncio
 import os
 import signal
 import sys
+from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import dotenv_values, find_dotenv, load_dotenv
+
+from .paths import use_workspace, workspace_dir
 
 from .agent import Agent
 from .ui import (
@@ -39,9 +42,9 @@ from .skills import (
 from .online_skill_eval import format_online_skill_eval_async
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(prog: str = "python -m agents.main") -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m agents.main",
+        prog=prog,
         description="ResearchAgent — an evolvable research assistant CLI",
         add_help=False,
     )
@@ -66,7 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-folding", action="store_true", help="Disable full session folding")
     parser.add_argument("--fold-threshold", type=float, default=0.70, help="Auto-fold at this fraction of the context window")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
-    return parser.parse_args()
+    parser.add_argument("-p", "--print", dest="print_once", action="store_true",
+                        help="Run the given task once and exit")
+    args = parser.parse_args()
+    if args.print_once and not " ".join(args.prompt).strip():
+        parser.error("--print requires a task")
+    return args
 
 
 def _resolve_permission_mode(args: argparse.Namespace) -> str:
@@ -94,6 +102,22 @@ def _load_env_file() -> None:
         load_dotenv(env_path, override=False)
     else:
         load_dotenv(override=False)
+
+
+def _load_cli_env() -> None:
+    # An alias in a lower-priority file must not override an exported credential.
+    alias_groups = (
+        {"APIKEY", "MINI_CLAUDE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"},
+        {"API", "MINI_CLAUDE_API_BASE", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"},
+    )
+    for path in (workspace_dir() / ".env", Path.home() / ".researchagent" / ".env"):
+        if not path.is_file():
+            continue
+        shadowed = set().union(*(group for group in alias_groups
+                                 if any(_clean_env(os.getenv(key)) for key in group)))
+        for key, value in dotenv_values(path).items():
+            if value is not None and key not in shadowed:
+                os.environ.setdefault(key, value)
 
 
 def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
@@ -124,7 +148,7 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
         return anthropic_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
 
     if openai_api_key or openai_api_base:
-        return openai_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
+        return openai_api_base or "https://api.openai.com/v1", generic_api_key or openai_api_key, True
 
     if generic_api_key:
         return None, generic_api_key, False
@@ -132,11 +156,11 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
     return None, None, False
 
 
-async def run_repl(agent: Agent) -> None:
+async def run_repl(agent: Agent, initial_prompt: str | None = None) -> None:
     # 交互入口也必须在事件循环关闭前回收 MCP；异常和 EOF 共用此路径。
     previous_sigint = signal.getsignal(signal.SIGINT)
     try:
-        await _run_repl(agent)
+        await _run_repl(agent, initial_prompt)
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         try:
@@ -145,7 +169,7 @@ async def run_repl(agent: Agent) -> None:
             await agent._mcp_manager.disconnect_all()
 
 
-async def _run_repl(agent: Agent) -> None:
+async def _run_repl(agent: Agent, initial_prompt: str | None = None) -> None:
     """Interactive REPL loop."""
 
     async def confirm_fn(message: str) -> bool:
@@ -202,6 +226,11 @@ async def _run_repl(agent: Agent) -> None:
 
     signal.signal(signal.SIGINT, handle_sigint)
     print_welcome()
+    if initial_prompt:
+        try:
+            await agent.chat(initial_prompt)
+        except Exception as exc:
+            print_error(str(exc))
 
     while True:
         print_user_prompt()
@@ -354,21 +383,36 @@ async def run_one_shot(agent: Agent, prompt: str) -> None:
         await agent._mcp_manager.disconnect_all()
 
 
+def cli_main() -> None:
+    with use_workspace(Path.cwd()):
+        _run_cli(installed=True)
+
+
 def main() -> None:
+    _run_cli(installed=False)
+
+
+def _run_cli(*, installed: bool) -> None:
     """CLI 程序入口：准备运行配置，创建 Agent，并按参数选择一次性执行或交互模式。"""
     # 解析命令行参数，例如 --plan、--resume、--model，以及可选的一次性 prompt。
     # 看看用户传入了哪些参数，再加载环境配置
-    args = parse_args()
-    _load_env_file()
+    args = parse_args("researchagent" if installed else "python -m agents.main")
+    if installed:
+        _load_cli_env()
+    else:
+        _load_env_file()
 
     if args.help:
         # 自定义帮助文本，展示 ResearchAgent 支持的启动参数和 REPL 内置命令。
         print("""
 ResearchAgent — an evolvable research assistant CLI
 
-Usage: python -m agents.main [options] [prompt]
+Usage: researchagent [options] [initial task]
+       researchagent -p TASK
+       python -m agents.main [options] [one-shot task]
 
 Options:
+  --print, -p         Execute one task and exit (requires task text)
   --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm every shell command
@@ -402,7 +446,8 @@ REPL commands:
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
 
 Examples:
-  Run from the ResearchAgent directory, with model and API settings in .env.
+  researchagent "inspect this project"  # stay in the conversation
+  researchagent -p "summarize experiment logs"
 
   python -m agents.main "analyze this repository's experiment setup"
   python -m agents.main --plan "plan how to reproduce the main experiment"
@@ -467,7 +512,7 @@ Examples:
     # 如果命令行后面带了普通文本参数，就拼成一次性 prompt；否则进入交互式 REPL。
     prompt = " ".join(args.prompt) if args.prompt else None
 
-    if prompt:
+    if prompt and (args.print_once or not installed):
         # One-shot mode
         # 一次性模式：执行完用户 prompt 后进程结束。
         try:
@@ -478,7 +523,7 @@ Examples:
     else:
         # Interactive REPL
         # 交互模式：启动循环读取用户输入，直到用户退出。
-        asyncio.run(run_repl(agent))
+        asyncio.run(run_repl(agent, prompt) if prompt else run_repl(agent))
 
 
 if __name__ == "__main__":

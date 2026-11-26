@@ -9,7 +9,7 @@ import re
 
 from .memory import _project_hash
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 
 from typing import Any
 import json
@@ -23,7 +23,7 @@ def _ensure_dir() -> None:
 
 
 def get_project_session_dir() -> Path:
-    d = Path.cwd() / RESEARCH_DIRNAME / "sessions"
+    d = workspace_dir() / RESEARCH_DIRNAME / "sessions"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

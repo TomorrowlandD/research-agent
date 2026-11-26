@@ -108,6 +108,21 @@ python -m agents.main --resume
 
 用 `python -m agents.main --resume <session_id>` 可指定快照，ID 取自 `~/.research/sessions/<session_id>.json` 的文件名。旧版快照需要显式指定 ID，CLI 会给出兼容提示；下次保存时写入新版元数据。路径审批和 Web 缓存在新进程中重新建立。要在最近会话中执行一次性任务，可用 `python -m agents.main --resume -- "继续上次的分析"`。
 
+## 在任意项目目录启动
+
+在 Python 3.11 环境中，从 ResearchAgent 源码根目录运行一次 `python -m pip install .`。开发时可用 `python -m pip install -e .`。新终端激活安装时的环境，确保该环境的可执行文件目录在 `PATH` 中。
+
+在 `~/.researchagent/.env` 配置模型凭据和模型名，可沿用上面的变量示例。安装版先读取进程环境，再读取启动目录的 `.env`，最后补充全局配置。同类凭据和接口地址的别名遵循同一顺序。启动目录决定项目规则、相对文件路径和 Shell 工作目录。
+
+```bash
+cd /你的/项目目录
+researchagent
+researchagent "梳理这个项目的目录结构"
+researchagent -p "列出项目的测试入口"
+```
+
+带任务启动会在首轮回答后继续接受追问。`-p` 或 `--print` 在本轮结束后退出。`python -m agents.main "任务"` 继续按一次性任务执行。
+
 ## 本地 Web 会话
 
 在已配置模型的工作区启动服务。默认地址为 `http://127.0.0.1:8765/`，可用 `--port` 指定其他端口。

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 
 from .memory import build_memory_prompt_section
 from .skills import build_skill_descriptions
@@ -175,7 +175,7 @@ def _load_rules_dir(directory: Path) -> str:
 def load_claude_md() -> str:
     """Walk up from cwd collecting all CLAUDE.md files, resolving @includes."""
     parts: list[str] = []
-    d = Path.cwd().resolve()
+    d = workspace_dir().resolve()
     while True:
         f = d / "CLAUDE.md"
         if f.is_file():
@@ -190,7 +190,7 @@ def load_claude_md() -> str:
             break
         d = parent
     # Load .research/rules/*.md from cwd
-    rules = _load_rules_dir(Path.cwd())
+    rules = _load_rules_dir(workspace_dir())
     claude_md = ""
     if parts:
         claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
@@ -233,7 +233,7 @@ def build_system_prompt() -> str:
     )
 
     replacements = {
-        "{{cwd}}": str(Path.cwd()),
+        "{{cwd}}": str(workspace_dir()),
         "{{date}}": today,
         "{{platform}}": plat,
         "{{shell}}": shell,

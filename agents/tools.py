@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 from .artifacts import DECISIONS, STATUSES
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 from .tool_result import ToolFailure
 from .web_tools import normalize_web_args, web_fetch, web_search
 
@@ -292,13 +292,13 @@ tool_definitions: list[ToolDef] = [
 #----------------------工具调用----------------------------
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
-    path = Path(raw_path)
+    path = workspace_dir() / raw_path
     # For writes, use the path shown in the approval, including new directories.
     if not must_exist or path.exists() or not path.is_absolute():
         return path
 
     parts = path.parts
-    cwd = Path.cwd()
+    cwd = workspace_dir()
     for i in range(1, len(parts)):
         candidate = cwd.joinpath(*parts[i:])
         if candidate.exists():
@@ -592,6 +592,7 @@ def _run_shell(inp: dict) -> str:
         result = subprocess.run(
             inp["command"],
             shell=True,
+            cwd=workspace_dir(),
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -661,7 +662,7 @@ def load_permission_rules() -> dict:
     deny: list[dict] = []
 
     user_settings = _load_settings(Path.home() / RESEARCH_DIRNAME / "settings.json")
-    project_settings = _load_settings(Path.cwd() / RESEARCH_DIRNAME / "settings.json")
+    project_settings = _load_settings(workspace_dir() / RESEARCH_DIRNAME / "settings.json")
 
     for settings in [user_settings, project_settings]:
         if not settings or "permissions" not in settings:
