@@ -29,6 +29,7 @@ from agents.deepseek import (
     normalize_usage, estimate_cost_usd,
 )
 
+from agents.event_log import SessionEventLog
 from agents.mcp_client import McpManager
 from agents.memory import _project_hash, MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
@@ -245,6 +246,7 @@ class Agent:
         self.effective_window = (CONTEXT_WINDOW - max_output_tokens - 20000
                                  if self._deepseek else _get_context_windows(model) - 20000)
         self.session_id = uuid.uuid4().hex[:8]
+        self._event_log = SessionEventLog(self.session_id, "openai" if self.use_openai else "anthropic")
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
         self.total_input_tokens = 0
@@ -537,9 +539,17 @@ class Agent:
 
     #主入口
 
-    async def  chat(self, user_message:str)->None:
+    async def chat(self, user_message: str) -> None:
+        try:
+            await self._chat_turn(user_message)
+        finally:
+            await self._event_log.flush()
+
+    async def _chat_turn(self, user_message: str) -> None:
         parent = _tool_span.get()
         self.trace_id = parent[0] if parent else uuid.uuid4().hex
+        original_user_message = _safe_utf8_text(user_message)
+        self._event_log.record(self.trace_id, "user_message", {"content": original_user_message})
         #懒加载MCP服务在第一次chat的时候
         if self.enable_mcp and not self._mcp_initialized:
             self._mcp_initialized = True
@@ -555,7 +565,6 @@ class Agent:
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
-        original_user_message = _safe_utf8_text(user_message)
         ready_skill_extraction_window: dict[str, Any] | None = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
@@ -957,6 +966,7 @@ class Agent:
         else:
             # 主动压缩后立即保存，允许旧历史在关闭思考压缩后安全切换模式。
             self._auto_save()
+            await self._event_log.flush()
 
 
     #恢复会话信息
@@ -986,6 +996,10 @@ class Agent:
                 self._plan_file_path = self._generate_plan_file_path()
         self._reset_context_budget()
         self._refresh_runtime_system_prompt()
+        self._event_log = SessionEventLog(self.session_id, protocol)
+        self._event_log.record(self.trace_id, "session_resumed", {
+            "message_count": self._get_message_count(), "schema_version": metadata.get("schema_version", 1),
+        })
         print_info(f"Session {self.session_id} restored ({self._get_message_count()} messages).")
 
 
@@ -1134,12 +1148,12 @@ class Agent:
             return False
         memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
-        self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
         content = format_folded_memory(memory)
         if pending:
             content += "\n\n" + pending["content"]
         self._anthropic_messages = [{"role": "user", "content": content}]
+        self._record_folded_session_memory(trigger, memory, len(messages), int(pending is not None))
         self._reset_context_budget()
         self._refresh_runtime_system_prompt()
         return True
@@ -1156,11 +1170,11 @@ class Agent:
             return False
         memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
-        self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
         self._openai_messages = [system_msg, {"role": "user", "content": format_folded_memory(memory)}]
         if pending:
             self._openai_messages.append(pending)
+        self._record_folded_session_memory(trigger, memory, len(messages), int(pending is not None))
         self._reset_context_budget()
         self._refresh_runtime_system_prompt()
         return True
@@ -1212,7 +1226,8 @@ class Agent:
         except Exception:
             logging.exception("fold observer failed")
 
-    def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any]) -> None:
+    def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any],
+                                      previous_count: int, retained_count: int) -> None:
         record = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "trigger": trigger,
@@ -1223,6 +1238,12 @@ class Agent:
             "folded_memory_characters": len(format_folded_memory(memory)),
             **memory,
         }
+        self._event_log.record(self.trace_id, "context_fold", {
+            "trigger": "threshold" if trigger == "auto" else trigger,
+            "pre_fold_message_count": previous_count,
+            "start_index": int(self.use_openai), "end_index_exclusive": previous_count - retained_count,
+            "retained_tail_messages": retained_count, "memory": memory,
+        })
         self._folded_session_memories.append(record)
         try:
             save_folded_session_memory(self.session_id, _sanitize_for_utf8(record))
@@ -1232,34 +1253,32 @@ class Agent:
     #多层级压缩流水线
     def _run_compression_pipeline(self)->None:
         if self.use_openai:
-            changes = (
-                self._budget_tool_results_openai(),
-                self._snip_stale_results_openai(),
-                self._microcompact_openai(),
-            )
+            changes = {"budget": self._budget_tool_results_openai(),
+                       "snip": self._snip_stale_results_openai(), "idle": self._microcompact_openai()}
         else:
-            changes = (
-                self._budget_tool_results_anthropic(),
-                self._snip_stale_results_anthropic(),
-                self._microcompact_anthropic(),
-            )
-
-        if any(changes):
+            changes = {"budget": self._budget_tool_results_anthropic(),
+                       "snip": self._snip_stale_results_anthropic(), "idle": self._microcompact_anthropic()}
+        affected = {stage: indices for stage, indices in changes.items() if indices}
+        if affected:
+            self._event_log.record(self.trace_id, "micro_compact", {
+                "message_indices_by_stage": affected, "message_count": self._get_message_count(),
+                "pre_compact_input_tokens": self.last_input_token_count,
+            })
             self._reset_context_budget()
 
     #第一层级压缩，预算压缩
-    def _budget_tool_results_anthropic(self)-> bool:
+    def _budget_tool_results_anthropic(self)-> list[int]:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
-            return False
+            return []
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
         budget = 15000 if utilization > 0.7 else 30000
 
-        changed = False
-        for msg in self._anthropic_messages:
+        changed = []
+        for index, msg in enumerate(self._anthropic_messages):
 
             #只处理 role 为 "user" 的消息。在工具调用流程中，工具的执行结果通常是以“用户”的身份反馈给模型的。
 
@@ -1271,33 +1290,33 @@ class Agent:
                     keep = (budget - 80) // 2
                     #重组新内容 = 开头部分 + 提示语 + 结尾部分
                     block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
-                    changed = True
+                    changed.append(index)
         return changed
 
-    def _budget_tool_results_openai(self)-> bool:
+    def _budget_tool_results_openai(self)-> list[int]:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
-            return False
+            return []
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
         budget = 15000 if utilization > 0.7 else 30000
 
-        changed = False
-        for msg in self._openai_messages:
+        changed = []
+        for index, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
                 keep = (budget - 80) // 2
                 msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
-                changed = True
+                changed.append(index)
         return changed
 
 
     #第二级策略：修剪过期的工具执行结果
-    def _snip_stale_results_anthropic(self) -> bool:
+    def _snip_stale_results_anthropic(self) -> list[int]:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
-            return False
+            return []
         results = []
         for mindex,  msg in enumerate(self._anthropic_messages):
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
@@ -1312,7 +1331,7 @@ class Agent:
                         results.append({"mindex": mindex, "bindex": bindex, "name": tool_info["name"], "file_path": tool_info.get("input", {}).get("file_path")})
 
         if len(results) <= KEEP_RECENT_RESULTS:
-            return False
+            return []
 
         to_snip =  set()
         seen_files: dict[str, list[int]] = {}
@@ -1333,31 +1352,31 @@ class Agent:
         for idx in to_snip:
             r = results[idx]
             self._anthropic_messages[r["mindex"]]["content"][r["bindex"]]["content"] = SNIP_PLACEHOLDER
-        return bool(to_snip)
+        return [results[idx]["mindex"] for idx in sorted(to_snip)]
 
-    def _snip_stale_results_openai(self) -> bool:
+    def _snip_stale_results_openai(self) -> list[int]:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
-            return False
+            return []
         tool_msgs = []
         for i, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
                 tool_msgs.append(i)
         if len(tool_msgs) <= KEEP_RECENT_RESULTS:
-            return False
+            return []
         snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(snip_count):
             self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
-        return snip_count > 0
+        return tool_msgs[:snip_count]
 
     #微压缩
 
     #基于“时间”的上下文瘦身策略，
     #如果已经很久没说话了，说明之前的工具执行结果你已经看完了，那就把它们清理掉，腾出空间
 
-    def _microcompact_anthropic(self) -> bool:
+    def _microcompact_anthropic(self) -> list[int]:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return False
+            return []
 
         all_results = []
         for mindex, msg in enumerate(self._anthropic_messages):
@@ -1371,11 +1390,11 @@ class Agent:
         for i in range(max(0, clear_count)):
             mi, bi = all_results[i]
             self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
-        return clear_count > 0
+        return [mi for mi, _ in all_results[:max(0, clear_count)]]
 
-    def _microcompact_openai(self) -> bool:
+    def _microcompact_openai(self) -> list[int]:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return False
+            return []
         tool_msgs = []
         for i, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
@@ -1383,7 +1402,7 @@ class Agent:
         clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
             self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
-        return clear_count > 0
+        return tool_msgs[:max(0, clear_count)]
 
     def _find_tool_use_by_id(self, tool_use_id: int) -> dict | None:
         for msg in self._anthropic_messages:
@@ -1398,28 +1417,32 @@ class Agent:
     #如果工具返回的结果太大（超过 30KB），不要硬塞进上下文里，而是把它存成一个临时文件。
     # 然后在对话里只留一个‘文件路径’和‘内容预览’。如果模型后面还需要看完整内容，它可以再次调用工具去读取这个文件
 
-    def _persist_large_result(self, tool_name: str, result: str) -> str:
-        THRESHOLD = 30 * 1024  # 30 KB
-        #转换成字节
-        if (len (result.encode())) <= THRESHOLD:
-            return result
+    def _persist_large_result(self, tool_name: str, result: str, *, call_id: str | None = None,
+                              is_error: bool = False) -> str:
+        content = _safe_utf8_text(result)
+        size = len(content.encode("utf-8"))
+        path = None
+        if size > 30 * 1024:
+            directory = Path.home() / RESEARCH_DIRNAME / "tool-results"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{uuid.uuid4().hex}-{tool_name}.txt"
+            path.write_text(content, encoding="utf-8")
+            lines = content.split("\n")
+            preview = "\n".join(lines[:200])[:8192]
+            content = (
+                f"[Result too large ({size / 1024:.1f} KB, {len(lines)} lines). "
+                f"Full output saved to {path}. "
+                f"You can use read_file to see the full result.]\n\n"
+                f"Preview (first 200 lines):\n{preview}"
+            )
+        if call_id is not None:
+            self._event_log.tool_result(self.trace_id, call_id, tool_name, content,
+                                        is_error=is_error, artifact_path=path)
+        return content
 
-        d = Path.home() / RESEARCH_DIRNAME / "tool-results"
-        d.mkdir(parents=True, exist_ok=True)
-        filename = f"{uuid.uuid4().hex}-{tool_name}.txt"
-        filepath = d / filename
-        filepath.write_text(result, encoding="utf-8")
-
-        lines = result.split("\n")
-        preview = "\n".join(lines[:200])[:8192]
-        size_kb = len(result.encode()) / 1024
-
-        return (
-            f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
-            f"Full output saved to {filepath}. "
-            f"You can use read_file to see the full result.]\n\n"
-            f"Preview (first 200 lines):\n{preview}"
-        )
+    def _anthropic_skipped_result(self, tool, reason: str) -> dict:
+        content = self._persist_large_result(tool.name, reason, call_id=tool.id, is_error=True)
+        return {"type": "tool_result", "tool_use_id": tool.id, "content": content, "is_error": True}
 
     #执行工具入口
 
@@ -1472,7 +1495,7 @@ class Agent:
     def _write_tool_trace(self, name: str, result: ToolExecutionResult, timestamp: str,
                           start: float, span_id: str, parent: tuple[str, str] | None) -> None:
         row = {
-            "timestamp": timestamp, "trace_id": self.trace_id, "span_id": span_id,
+            "timestamp": timestamp, "session_id": self.session_id, "trace_id": self.trace_id, "span_id": span_id,
             "parent_span_id": parent[1] if parent else None, "agent_role": self.agent_role,
             "tool_name": name, "source_type": "mcp" if name.startswith("mcp__") else "builtin",
             "latency_ms": round((time.monotonic() - start) * 1000, 3),
@@ -1806,6 +1829,11 @@ class Agent:
             await self._ensure_context_budget()
             response = await self._call_anthropic_stream()
             self.last_finish_reason = response.stop_reason
+            raw_blocks = getattr(response, "raw_content", response.content)
+            self._event_log.record(self.trace_id, "assistant_message", {
+                "message": {"role": "assistant", "content": [self._raw_anthropic_block(b) for b in raw_blocks]},
+                "stop_reason": response.stop_reason,
+            })
             if not self.is_sub_agent:
                 stop_spinner()
 
@@ -1866,12 +1894,7 @@ class Agent:
                 self._anthropic_messages.append({
                     "role": "user",
                     "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tu.id,
-                            "content": f"Tool execution skipped: {budget['reason']}",
-                            "is_error": True,
-                        }
+                        self._anthropic_skipped_result(tu, f"Tool execution skipped: {budget['reason']}")
                         for tu in tool_uses
                     ],
                 })
@@ -1890,8 +1913,7 @@ class Agent:
                 inp, error = prepared[tu.id]
                 if error is not None:
                     self._record_tool_outcome(tu.name, False)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": error, "is_error": True})
+                    tool_results.append(self._anthropic_skipped_result(tu, error))
                     continue
                 print_tool_call(tu.name, inp)
 
@@ -1901,20 +1923,19 @@ class Agent:
                     # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
                     print_info(f"Denied: {perm.get('message', '')}")
                     self._record_tool_outcome(tu.name, False)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": f"Action denied: {perm.get('message', '')}", "is_error": True})
+                    tool_results.append(self._anthropic_skipped_result(tu, f"Action denied: {perm.get('message', '')}"))
                     continue
 
                 if perm["action"] == "confirm":
                     if not await self._confirm_tool_call(tu.name, perm):
                         self._record_tool_outcome(tu.name, False)
-                        tool_results.append(
-                            {"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action.", "is_error": True})
+                        tool_results.append(self._anthropic_skipped_result(tu, "User denied this action."))
                         continue
 
                 # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
                 outcome = await self._execute_tool_call(tu.name, inp)
-                res = self._persist_large_result(tu.name, _safe_utf8_text(outcome.content))
+                res = self._persist_large_result(tu.name, outcome.content,
+                                                 call_id=tu.id, is_error=outcome.is_error)
                 print_tool_result(tu.name, res)
                 self._record_tool_outcome(tu.name, outcome.ok)
 
@@ -1942,6 +1963,14 @@ class Agent:
             self._context_cleared = False
 
             self._refresh_runtime_system_prompt()
+
+    @staticmethod
+    def _raw_anthropic_block(block) -> dict:
+        if hasattr(block, "model_dump"):
+            return block.model_dump(mode="json", exclude_none=True)
+        # Streamed tool inputs can be malformed JSON; keep the exact input
+        # used by the validator, before it builds the model-facing diagnostic.
+        return {key: value for key, value in vars(block).items() if key != "input_is_json"}
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -2002,11 +2031,14 @@ class Agent:
                                 first_text = False
                             await self._emit_text(delta.text)
                         elif hasattr(delta, "thinking"):
+                            block.thinking = getattr(block, "thinking", "") + delta.thinking
                             if first_text:
                                 stop_spinner()
                                 await self._emit_text("\n  [thinking] ", thinking=True)
                                 first_text = False
                             await self._emit_text(delta.thinking, thinking=True)
+                        elif hasattr(delta, "signature"):
+                            block.signature = getattr(block, "signature", "") + delta.signature
                         elif hasattr(delta, "partial_json") and block.type == "tool_use":
                             if not block.input_is_json:
                                 block.input = ""
@@ -2026,6 +2058,7 @@ class Agent:
                 raise ValueError("Incomplete Anthropic response; no tools executed.")
             return SimpleNamespace(
                 content=[block for _, block in sorted(blocks.items()) if block.type != "thinking"],
+                raw_content=[block for _, block in sorted(blocks.items())],
                 usage=usage, stop_reason=stop_reason,
             )
 #调用 _do()，如果遇到可重试错误，就由 _with_retry() 负责重试。
@@ -2090,6 +2123,10 @@ class Agent:
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             self.last_finish_reason = choice.get("finish_reason")
             message = choice.get("message", {})
+
+            self._event_log.record(self.trace_id, "assistant_message", {
+                "message": message, "finish_reason": self.last_finish_reason,
+            })
 
             # Keep DeepSeek protocol checks separate from recoverable argument errors.
             if self._deepseek:
@@ -2184,24 +2221,34 @@ class Agent:
                     if batch["concurrent"]:
                         async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool]:
                             outcome = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            res = self._persist_large_result(ct_item["fn"], _safe_utf8_text(outcome.content))
+                            res = self._persist_large_result(ct_item["fn"], outcome.content,
+                                                            call_id=ct_item["tc"]["id"], is_error=outcome.is_error)
                             print_tool_result(ct_item["fn"], res)
                             return ct_item, res, outcome.ok
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res, ok in results:
-                            self._record_tool_outcome(ct_item["fn"], ok)
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                        tasks = [asyncio.create_task(_run_oai_safe(ct)) for ct in batch["items"]]
+                        try:
+                            await asyncio.gather(*tasks)
+                        finally:
+                            # A sibling can be cancelled after a result was logged. Keep
+                            # that real receipt before filling the remaining IDs as skipped.
+                            for task in tasks:
+                                if task.done() and not task.cancelled() and task.exception() is None:
+                                    ct_item, res, ok = task.result()
+                                    self._record_tool_outcome(ct_item["fn"], ok)
+                                    self._openai_messages.append(
+                                        {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
                         for ct in batch["items"]:
                             if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                                call_id = ct["tc"]["id"]
+                                res = self._persist_large_result(ct["fn"], ct["result"], call_id=call_id, is_error=True)
+                                self._openai_messages.append({"role": "tool", "tool_call_id": call_id, "content": res})
                                 continue
 
                             outcome = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            res = self._persist_large_result(ct["fn"], _safe_utf8_text(outcome.content))
+                            res = self._persist_large_result(ct["fn"], outcome.content,
+                                                            call_id=ct["tc"]["id"], is_error=outcome.is_error)
                             print_tool_result(ct["fn"], res)
                             self._record_tool_outcome(ct["fn"], outcome.ok)
 
@@ -2239,8 +2286,9 @@ class Agent:
                 continue
             tool_call_id = tc.get("id")
             if tool_call_id and tool_call_id not in existing_ids:
+                content = self._persist_large_result(tc["function"]["name"], reason, call_id=tool_call_id, is_error=True)
                 self._openai_messages.append(
-                    {"role": "tool", "tool_call_id": tool_call_id, "content": reason}
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": content}
                 )
                 existing_ids.add(tool_call_id)
 

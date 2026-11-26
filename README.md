@@ -71,7 +71,7 @@ ResearchAgent/
 └── README.md
 ```
 
-本地运行还会按需使用两个数据目录。用户主目录下的 `~/.research/sessions/` 保存可恢复的完整会话，`~/.research/projects/<hash>/memory/` 保存项目长期记忆。项目根目录下的 `.research/` 存放本地规则、Skills、子 Agent 定义、折叠与演化记录，整个目录由 Git 忽略。本地参考资料目录 `wiki/`、`notes/` 和 `paper/` 也由 Git 忽略。
+本地运行还会按需使用两个数据目录。用户主目录下的 `~/.research/sessions/<session_id>.json` 保存用于恢复的当前上下文快照，同目录的 `<session_id>.events.jsonl` 按发生顺序追加用户输入、模型响应、工具结果、压缩、折叠和恢复事件。折叠前的记录可以按 `seq` 回查；超过 30 KiB 的工具结果可通过事件中的 `artifact_path` 找到原件。项目长期记忆保存在 `~/.research/projects/<hash>/memory/`。项目根目录下的 `.research/` 存放本地规则、Skills、子 Agent 定义、折叠与演化记录，整个目录由 Git 忽略。本地参考资料目录 `wiki/`、`notes/` 和 `paper/` 也由 Git 忽略。
 
 ## 在 WSL Ubuntu 中运行
 
