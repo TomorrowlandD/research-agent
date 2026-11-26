@@ -255,7 +255,7 @@ class Agent:
         self.cache_miss_tokens = 0
         self.reasoning_tokens = 0
         self._deepseek_cost_usd = 0.0
-        self.last_input_token_count = 0
+        self._reset_context_budget()
         self.last_finish_reason: str | None = None
         self.current_turns = 0
         self.last_api_call_time = 0
@@ -354,7 +354,7 @@ class Agent:
         else:
             self.total_input_tokens += normalized["prompt_tokens"]
             self.total_output_tokens += normalized["completion_tokens"]
-            self.last_input_token_count = normalized["prompt_tokens"]
+            self._record_context_usage(normalized["prompt_tokens"])
         if self._deepseek:
             self.cache_hit_tokens += normalized["cache_hit_tokens"]
             self.cache_miss_tokens += normalized["cache_miss_tokens"]
@@ -917,7 +917,7 @@ class Agent:
         self.cache_miss_tokens = 0
         self.reasoning_tokens = 0
         self._deepseek_cost_usd = 0.0
-        self.last_input_token_count = 0
+        self._reset_context_budget()
         print_info("Conversation cleared.")
 
     def show_cost(self):
@@ -1048,8 +1048,40 @@ class Agent:
             pass
 
     #自动压缩
-    async def _check_and_compact(self)->None:
-        if self.enable_folding and not self._fold_limit_reached() and self.last_input_token_count > self.effective_window * self.auto_compact_threshold:
+    def _reset_context_budget(self) -> None:
+        self.last_input_token_count = 0
+        self.last_accounted_msg_index = 0
+        self._accounted_system_prompt = ""
+
+    def _record_context_usage(self, tokens: int) -> None:
+        if tokens > 0:
+            self.last_input_token_count = tokens
+            self.last_accounted_msg_index = self._get_message_count()
+            self._accounted_system_prompt = self._system_prompt
+
+    @staticmethod
+    def _estimate_tokens(value: Any) -> int:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        # UTF-8 captures multibyte text. Digits and punctuation in code/JSON
+        # can tokenize individually, so give them a higher weight than prose.
+        size = len(text.encode("utf-8", errors="replace"))
+        dense = sum(not char.isalpha() and not char.isspace() for char in text)
+        return (size + 2 * dense + 2) // 3 + 4
+
+    async def _ensure_context_budget(self) -> None:
+        if not self.enable_folding or self._fold_limit_reached():
+            return
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        estimate = self.last_input_token_count
+        if not self.last_accounted_msg_index:
+            tools = get_active_tool_definitions(self.tools)
+            estimate += self._estimate_tokens(_to_openai_tools(tools) if self.use_openai else tools)
+            if not self.use_openai:
+                estimate += self._estimate_tokens(self._system_prompt)
+        elif self._accounted_system_prompt != self._system_prompt:
+            estimate += self._estimate_tokens(self._system_prompt) - self._estimate_tokens(self._accounted_system_prompt)
+        estimate += sum(self._estimate_tokens(msg) for msg in messages[self.last_accounted_msg_index:])
+        if estimate > self.effective_window * self.auto_compact_threshold:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
@@ -1068,37 +1100,45 @@ class Agent:
         return self.max_fold_limit is not None and self._fold_count >= self.max_fold_limit
 
     async def _compact_anthropic(self, *, trigger: str)->bool:
-        if len (self._anthropic_messages)<4:
+        messages = self._anthropic_messages
+        pending = messages[-1] if (trigger == "auto" and messages and messages[-1].get("role") == "user"
+                                   and isinstance(messages[-1].get("content"), str)) else None
+        if len(messages) < (3 if trigger == "auto" else 4):
             return False
 
-        transcript = build_anthropic_transcript(_sanitize_for_utf8(self._anthropic_messages))
+        transcript = build_anthropic_transcript(_sanitize_for_utf8(messages[:-1] if pending else messages))
         if not transcript.strip():
             return False
         memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
-        self._anthropic_messages = [{"role": "user", "content": format_folded_memory(memory)}]
-        self.last_input_token_count = 0
+        content = format_folded_memory(memory)
+        if pending:
+            content += "\n\n" + pending["content"]
+        self._anthropic_messages = [{"role": "user", "content": content}]
+        self._reset_context_budget()
         self._refresh_runtime_system_prompt()
         return True
 
     async def _compact_openai(self, *, trigger: str)->bool:
-        if len (self._openai_messages)<4:
+        messages = self._openai_messages
+        pending = messages[-1] if (trigger == "auto" and messages and messages[-1].get("role") == "user"
+                                   and isinstance(messages[-1].get("content"), str)) else None
+        if len(messages) < 4:
             return False
         system_msg = self._openai_messages[0]
-        transcript = build_openai_transcript(_sanitize_for_utf8(self._openai_messages))
+        transcript = build_openai_transcript(_sanitize_for_utf8(messages[:-1] if pending else messages))
         if not transcript.strip():
             return False
         memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
-        self._openai_messages=[
-            system_msg,
-            {"role": "user", "content": format_folded_memory(memory)},
-        ]
-        self.last_input_token_count=0
+        self._openai_messages = [system_msg, {"role": "user", "content": format_folded_memory(memory)}]
+        if pending:
+            self._openai_messages.append(pending)
+        self._reset_context_budget()
         self._refresh_runtime_system_prompt()
         return True
 
@@ -1169,25 +1209,33 @@ class Agent:
     #多层级压缩流水线
     def _run_compression_pipeline(self)->None:
         if self.use_openai:
-            self._budget_tool_results_openai()
-            self._snip_stale_results_openai()
-            self._microcompact_openai()
+            changes = (
+                self._budget_tool_results_openai(),
+                self._snip_stale_results_openai(),
+                self._microcompact_openai(),
+            )
         else:
-            self._budget_tool_results_anthropic()
-            self._snip_stale_results_anthropic()
-            self._microcompact_anthropic()
+            changes = (
+                self._budget_tool_results_anthropic(),
+                self._snip_stale_results_anthropic(),
+                self._microcompact_anthropic(),
+            )
+
+        if any(changes):
+            self._reset_context_budget()
 
     #第一层级压缩，预算压缩
-    def _budget_tool_results_anthropic(self)->None:
+    def _budget_tool_results_anthropic(self)-> bool:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
-            return
+            return False
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
         budget = 15000 if utilization > 0.7 else 30000
 
+        changed = False
         for msg in self._anthropic_messages:
 
             #只处理 role 为 "user" 的消息。在工具调用流程中，工具的执行结果通常是以“用户”的身份反馈给模型的。
@@ -1200,28 +1248,33 @@ class Agent:
                     keep = (budget - 80) // 2
                     #重组新内容 = 开头部分 + 提示语 + 结尾部分
                     block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
+                    changed = True
+        return changed
 
-    def _budget_tool_results_openai(self)->None:
+    def _budget_tool_results_openai(self)-> bool:
         #计算利用率：utilization = 已用Token / 有效窗口大小。
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
-            return
+            return False
         #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
         # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
         budget = 15000 if utilization > 0.7 else 30000
 
+        changed = False
         for msg in self._openai_messages:
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
                 keep = (budget - 80) // 2
                 msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
+                changed = True
+        return changed
 
 
     #第二级策略：修剪过期的工具执行结果
-    def _snip_stale_results_anthropic(self) -> None:
+    def _snip_stale_results_anthropic(self) -> bool:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
-            return
+            return False
         results = []
         for mindex,  msg in enumerate(self._anthropic_messages):
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
@@ -1236,7 +1289,7 @@ class Agent:
                         results.append({"mindex": mindex, "bindex": bindex, "name": tool_info["name"], "file_path": tool_info.get("input", {}).get("file_path")})
 
         if len(results) <= KEEP_RECENT_RESULTS:
-            return
+            return False
 
         to_snip =  set()
         seen_files: dict[str, list[int]] = {}
@@ -1257,29 +1310,31 @@ class Agent:
         for idx in to_snip:
             r = results[idx]
             self._anthropic_messages[r["mindex"]]["content"][r["bindex"]]["content"] = SNIP_PLACEHOLDER
+        return bool(to_snip)
 
-    def _snip_stale_results_openai(self) -> None:
+    def _snip_stale_results_openai(self) -> bool:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
-            return
+            return False
         tool_msgs = []
         for i, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] != SNIP_PLACEHOLDER:
                 tool_msgs.append(i)
         if len(tool_msgs) <= KEEP_RECENT_RESULTS:
-            return
+            return False
         snip_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(snip_count):
             self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
+        return snip_count > 0
 
     #微压缩
 
     #基于“时间”的上下文瘦身策略，
     #如果已经很久没说话了，说明之前的工具执行结果你已经看完了，那就把它们清理掉，腾出空间
 
-    def _microcompact_anthropic(self) -> None:
+    def _microcompact_anthropic(self) -> bool:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
+            return False
 
         all_results = []
         for mindex, msg in enumerate(self._anthropic_messages):
@@ -1293,10 +1348,11 @@ class Agent:
         for i in range(max(0, clear_count)):
             mi, bi = all_results[i]
             self._anthropic_messages[mi]["content"][bi]["content"] = "[Old result cleared]"
+        return clear_count > 0
 
-    def _microcompact_openai(self) -> None:
+    def _microcompact_openai(self) -> bool:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
+            return False
         tool_msgs = []
         for i, msg in enumerate(self._openai_messages):
             if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and msg["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
@@ -1304,6 +1360,7 @@ class Agent:
         clear_count = len(tool_msgs) - KEEP_RECENT_RESULTS
         for i in range(max(0, clear_count)):
             self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
+        return clear_count > 0
 
     def _find_tool_use_by_id(self, tool_use_id: int) -> dict | None:
         for msg in self._anthropic_messages:
@@ -1608,7 +1665,7 @@ class Agent:
         self._openai_messages = []
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
-        self.last_input_token_count = 0
+        self._reset_context_budget()
         self._fold_last_time = 0.0
         self._fold_count = 0
         self._tool_error_streak = 0
@@ -1723,6 +1780,7 @@ class Agent:
 
 
             # 等完整响应成功后才执行工具。流式请求可能重试，提前执行会让同一工具产生重复副作用。
+            await self._ensure_context_budget()
             response = await self._call_anthropic_stream()
             self.last_finish_reason = response.stop_reason
             if not self.is_sub_agent:
@@ -1732,7 +1790,10 @@ class Agent:
             self.last_api_call_time = time.time()
             self.total_input_tokens += response.usage.input_tokens
             self.total_output_tokens += response.usage.output_tokens
-            self.last_input_token_count = response.usage.input_tokens
+            self._record_context_usage(
+                response.usage.input_tokens + (getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+                + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
+            )
 
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -1857,9 +1918,7 @@ class Agent:
 
             self._context_cleared = False
 
-            # 工具结果可能很长，每轮工具执行后检查是否需要压缩上下文。
             self._refresh_runtime_system_prompt()
-            await self._check_and_compact()
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -1994,6 +2053,7 @@ class Agent:
             if not self.is_sub_agent:
                 start_spinner()
 
+            await self._ensure_context_budget()
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
@@ -2143,7 +2203,6 @@ class Agent:
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
-            await self._check_and_compact()
 
     def _append_openai_skipped_tool_results(self, tool_calls: list[dict], reason: str) -> None:
         """Ensure every OpenAI tool_call gets a matching tool message."""

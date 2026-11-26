@@ -25,7 +25,7 @@ class FoldingSwitchTests(unittest.TestCase):
         self.assertNotIn("compact_context", [tool["name"] for tool in agent.tools])
         agent.last_input_token_count = agent.effective_window
         with patch.object(agent, "_compact_conversation", new_callable=AsyncMock) as compact:
-            asyncio.run(agent._check_and_compact())
+            asyncio.run(agent._ensure_context_budget())
             compact.assert_not_awaited()
         self.assertFalse(asyncio.run(agent._compact_conversation(trigger="manual")))
         with self.assertRaisesRegex(ToolFailure, "disabled"):
