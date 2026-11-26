@@ -123,6 +123,15 @@ researchagent -p "列出项目的测试入口"
 
 带任务启动会在首轮回答后继续接受追问。`-p` 或 `--print` 在本轮结束后退出。`python -m agents.main "任务"` 继续按一次性任务执行。
 
+从同一目录继续工作时，用 `researchagent -c` 恢复当前目录与模型协议下最近更新的会话，用 `researchagent -r` 按编号选择。列表显示本地时间、会话 ID 和任务预览。空回车、`q` 或 Ctrl+C 取消选择。
+
+```bash
+researchagent -c -p "接着整理上一次的结果"
+researchagent --resume SESSION_ID -p "继续分析"
+```
+
+`-c` 找不到匹配会话时返回非零；`-r` 的空列表或取消返回零。`-r` 需要终端选择，与 `-p` 互斥。旧快照可用 `--resume SESSION_ID` 显式恢复。
+
 ## 本地 Web 会话
 
 在已配置模型的工作区启动服务。默认地址为 `http://127.0.0.1:8765/`，可用 `--port` 指定其他端口。

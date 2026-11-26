@@ -28,7 +28,7 @@ from .ui import (
     print_skill_entries,
     print_warning,
 )
-from .session import load_session, get_latest_session_id
+from .session import load_session, get_latest_session_id, project_sessions
 from .memory import list_memories
 from .skills import (
     create_skill,
@@ -62,7 +62,12 @@ def parse_args(prog: str = "python -m agents.main") -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=None, help="Output budget including reasoning tokens")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
-    parser.add_argument("--resume", nargs="?", const="", metavar="SESSION_ID",
+    recovery = parser.add_mutually_exclusive_group()
+    recovery.add_argument("-c", "--continue", dest="continue_latest", action="store_true",
+                          help="Continue the latest session for this project and protocol")
+    recovery.add_argument("-r", dest="select_session", action="store_true",
+                          help="Choose a session for this project and protocol")
+    recovery.add_argument("--resume", nargs="?", const="", metavar="SESSION_ID",
                         help="Resume a session by ID, or the latest for this project and protocol")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
@@ -74,6 +79,8 @@ def parse_args(prog: str = "python -m agents.main") -> argparse.Namespace:
     args = parser.parse_args()
     if args.print_once and not " ".join(args.prompt).strip():
         parser.error("--print requires a task")
+    if args.select_session and args.print_once:
+        parser.error("-r requires an interactive selection and cannot be combined with --print")
     return args
 
 
@@ -383,6 +390,29 @@ async def run_one_shot(agent: Agent, prompt: str) -> None:
         await agent._mcp_manager.disconnect_all()
 
 
+def _choose_session(protocol: str) -> str | None:
+    sessions = project_sessions(protocol)
+    if not sessions:
+        print_info("No previous sessions found for this project and protocol.")
+        return None
+    for number, (updated, session_id, preview) in enumerate(sessions, start=1):
+        print(f"[{number}] {updated.astimezone():%Y-%m-%d %H:%M} | {session_id} | {preview}")
+    while True:
+        try:
+            reply = input("输入编号恢复会话，按回车或 q 取消：").strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not reply or reply.lower() == "q":
+            return None
+        try:
+            index = int(reply)
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(sessions):
+            return sessions[index - 1][1]
+        print_info(f"请输入 1 到 {len(sessions)} 之间的编号，或 q 取消。")
+
+
 def cli_main() -> None:
     with use_workspace(Path.cwd()):
         _run_cli(installed=True)
@@ -423,6 +453,8 @@ Options:
   --max-output-tokens Output budget, including reasoning tokens
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
+  -c, --continue      Continue latest in this project and protocol; fails if none
+  -r                  Pick a saved session by number; empty input or q cancels
   --resume [ID]       Resume by ID, or the latest session for this project and protocol
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
@@ -489,11 +521,18 @@ Examples:
         auto_compact_threshold=args.fold_threshold,
     )
 
-    if args.resume is not None:
+    if args.resume is not None or args.continue_latest or args.select_session:
         protocol = "openai" if resolved_use_openai else "anthropic"
-        session_id = args.resume or get_latest_session_id(protocol)
+        if args.select_session:
+            session_id = _choose_session(protocol)
+            if session_id is None:
+                return
+        else:
+            session_id = args.resume or get_latest_session_id(protocol)
         if session_id is None:
             print_info("No previous sessions found for this project and protocol.")
+            if args.continue_latest:
+                sys.exit(1)
         else:
             try:
                 session = load_session(session_id)

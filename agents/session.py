@@ -73,27 +73,52 @@ def load_session(session_id: str) -> dict[str, Any] | None:
     return data
 
 
-def list_sessions() -> list[dict[str, Any]]:
-    results = []
+def _snapshots():
     for path in SESSION_DIR.glob("*.json"):
         try:
             session = load_session(path.stem)
         except ValueError:
             continue
         if session is not None:
-            results.append(session["metadata"])
-    return results
+            yield session
 
 
-def get_latest_session_id(protocol: str) -> str | None:
+def list_sessions() -> list[dict[str, Any]]:
+    return [session["metadata"] for session in _snapshots()]
+
+
+def _session_preview(session: dict[str, Any], protocol: str) -> str:
+    key = "openaiMessages" if protocol == "openai" else "anthropicMessages"
+    messages = session.get(key)
+    if not isinstance(messages, list):
+        return ""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(block["text"] for block in content if isinstance(block, dict)
+                               and block.get("type") == "text" and isinstance(block.get("text"), str))
+        if isinstance(content, str) and content.strip():
+            return " ".join("".join(c if c.isprintable() else " " for c in content[:200]).split())[:72]
+    return ""
+
+
+def project_sessions(protocol: str) -> list[tuple[datetime, str, str]]:
     project = _project_hash()
     matching = []
-    for meta in list_sessions():
+    for session in _snapshots():
+        meta = session["metadata"]
         if meta.get("project_hash") != project or meta.get("protocol") != protocol:
             continue
         try:
-            updated = datetime.fromisoformat(meta["updated_at"])
-        except (KeyError, TypeError, ValueError):
+            updated = datetime.fromisoformat(meta["updated_at"]).astimezone(timezone.utc)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
             continue
-        matching.append((updated.astimezone(timezone.utc), meta["session_id"]))
-    return max(matching)[1] if matching else None
+        matching.append((updated, meta["session_id"], _session_preview(session, protocol)))
+    return sorted(matching, reverse=True)
+
+
+def get_latest_session_id(protocol: str) -> str | None:
+    matching = project_sessions(protocol)
+    return matching[0][1] if matching else None

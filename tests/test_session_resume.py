@@ -88,6 +88,62 @@ class SessionResumeTests(unittest.TestCase):
         self.assertEqual(load_session("old")["metadata"]["created_at"], legacy["metadata"]["startTime"])
         self.assertEqual(get_latest_session_id("openai"), "old")
 
+    def invoke_installed(self, args, protocol="openai"):
+        from agents.main import cli_main
+
+        with (patch("sys.argv", ["researchagent", *args]), patch("agents.main._load_cli_env"),
+              patch("agents.main._resolve_api_config", return_value=("http://example.test", "key", protocol == "openai")),
+              patch("agents.agent.build_system_prompt", return_value="system"),
+              patch("agents.main.run_one_shot", new_callable=AsyncMock) as once,
+              patch("agents.main.run_repl", new_callable=AsyncMock) as repl):
+            cli_main()
+            return once, repl
+
+    def test_project_selection_and_latest_for_both_protocols(self):
+        from agents.memory import _project_hash
+        from agents.session import project_sessions
+
+        for directory in (self.project, self.other):
+            with chdir(directory):
+                for protocol in ("openai", "anthropic"):
+                    for n in (1, 2):
+                        sid = f"{directory.name}-{protocol}-{n}"
+                        key = "openaiMessages" if protocol == "openai" else "anthropicMessages"
+                        content = "old task" if protocol == "openai" else [{"type": "text", "text": "old task"}]
+                        save_session(sid, {"metadata": {"session_id": sid, "project_hash": _project_hash(),
+                                     "protocol": protocol, "updated_at": f"2026-11-0{n}T01:00:00Z"},
+                                     key: [{"role": "user", "content": content}]})
+        for directory in (self.project, self.other):
+            with chdir(directory):
+                for protocol in ("openai", "anthropic"):
+                    with self.subTest(directory=directory, protocol=protocol):
+                        prefix = f"{directory.name}-{protocol}-"
+                        self.assertEqual([(sid, title) for _, sid, title in project_sessions(protocol)],
+                                         [(prefix + "2", "old task"), (prefix + "1", "old task")])
+                        once, _ = self.invoke_installed(["-c", "-p", "continue"], protocol)
+                        self.assertEqual(once.await_args.args[0].session_id, prefix + "2")
+                        with patch("builtins.input", side_effect=["invalid", "0", "3", "2"]):
+                            _, repl = self.invoke_installed(["-r"], protocol)
+                        self.assertEqual(repl.await_args.args[0].session_id, prefix + "1")
+
+    def test_empty_cancel_and_conflicts(self):
+        with self.assertRaises(SystemExit) as error:
+            self.invoke_installed(["-c"])
+        self.assertEqual(error.exception.code, 1)
+        with patch("builtins.input", side_effect=AssertionError("unexpected input")):
+            _, repl = self.invoke_installed(["-r"])
+            repl.assert_not_awaited()
+        self.agent()._auto_save()
+        for answer in ("q", "", KeyboardInterrupt(), EOFError()):
+            with self.subTest(answer=answer), patch("builtins.input", side_effect=[answer]):
+                once, repl = self.invoke_installed(["-r"])
+                once.assert_not_awaited()
+                repl.assert_not_awaited()
+        for args in (["-c", "-r"], ["-r", "--resume", "id"], ["--resume", "-c"], ["-r", "-p", "task"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as error:
+                self.invoke_installed(args)
+            self.assertEqual(error.exception.code, 2)
+
     def test_explicit_missing_or_invalid_id_aborts(self):
         for session_id in ("missing", "../outside"):
             with self.subTest(session_id=session_id), patch("agents.main.print_error"), self.assertRaises(SystemExit):
