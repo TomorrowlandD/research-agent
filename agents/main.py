@@ -59,7 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=None, help="Output budget including reasoning tokens")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
-    parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("--resume", nargs="?", const="", metavar="SESSION_ID",
+                        help="Resume a session by ID, or the latest for this project and protocol")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--no-folding", action="store_true", help="Disable full session folding")
@@ -378,7 +379,7 @@ Options:
   --max-output-tokens Output budget, including reasoning tokens
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
-  --resume            Resume the last session
+  --resume [ID]       Resume by ID, or the latest session for this project and protocol
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --no-folding        Disable full session folding
@@ -443,22 +444,25 @@ Examples:
         auto_compact_threshold=args.fold_threshold,
     )
 
-    # Resume session
-    # --resume 会加载最近一次会话，把历史消息恢复到新建的 Agent 中。
-    if args.resume:
-        session_id = get_latest_session_id()
-        if session_id:
-            session = load_session(session_id)
-            if session:
-                try:
-                    agent.restore_session(session)
-                except ValueError as e:
-                    print_error(str(e))
-                    sys.exit(1)
-            else:
-                print_info("No session found to resume.")
+    if args.resume is not None:
+        protocol = "openai" if resolved_use_openai else "anthropic"
+        session_id = args.resume or get_latest_session_id(protocol)
+        if session_id is None:
+            print_info("No previous sessions found for this project and protocol.")
         else:
-            print_info("No previous sessions found.")
+            try:
+                session = load_session(session_id)
+                if session is None:
+                    raise ValueError(f"Session {session_id} was not found or could not be read.")
+                meta = session["metadata"]
+                if not (meta.get("project_hash") and meta.get("protocol")):
+                    if not args.resume:
+                        raise ValueError("Legacy snapshot requires an explicit session ID.")
+                    print_warning("Legacy snapshot: project or protocol metadata is incomplete.")
+                agent.restore_session(session)
+            except ValueError as exc:
+                print_error(str(exc))
+                sys.exit(1)
 
     # 如果命令行后面带了普通文本参数，就拼成一次性 prompt；否则进入交互式 REPL。
     prompt = " ".join(args.prompt) if args.prompt else None

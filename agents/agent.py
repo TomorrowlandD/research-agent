@@ -30,7 +30,7 @@ from agents.deepseek import (
 )
 
 from agents.mcp_client import McpManager
-from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
+from agents.memory import _project_hash, MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
 from agents.session_memory import (
     FOLD_COMPONENT_SYSTEMS,
@@ -43,7 +43,7 @@ from agents.session_memory import (
     parse_folded_memory,
     parse_fold_component,
 )
-from agents.session import save_folded_session_memory, save_session
+from agents.session import save_folded_session_memory, save_session, validate_session_id
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions, validate_tool_arguments
@@ -961,6 +961,16 @@ class Agent:
 
     #恢复会话信息
     def restore_session(self, data:dict)->None:
+        metadata = data.get("metadata", {})
+        if metadata.get("project_hash") and metadata["project_hash"] != _project_hash():
+            raise ValueError("Cannot resume a session from a different project.")
+        protocol = "openai" if self.use_openai else "anthropic"
+        other_history = "anthropicMessages" if self.use_openai else "openaiMessages"
+        if metadata.get("protocol", protocol) != protocol or data.get(other_history):
+            raise ValueError(f"Cannot resume session: model protocol does not match {protocol}.")
+        session_id = metadata.get("session_id", metadata.get("id"))
+        if session_id is not None:
+            validate_session_id(session_id)
         if data.get("openaiMessages"):
             self._validate_deepseek_history(data["openaiMessages"])
         if data.get("anthropicMessages"):
@@ -969,7 +979,14 @@ class Agent:
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
         if isinstance(data.get("foldedSessionMemories"), list):
             self._folded_session_memories = _sanitize_for_utf8(data["foldedSessionMemories"])
-        print_info(f"Session restored ({self._get_message_count()} messages).")
+        if session_id is not None:
+            self.session_id = session_id
+            self.session_start_time = metadata.get("created_at") or metadata.get("startTime") or self.session_start_time
+            if self.permission_mode == "plan":
+                self._plan_file_path = self._generate_plan_file_path()
+        self._reset_context_budget()
+        self._refresh_runtime_system_prompt()
+        print_info(f"Session {self.session_id} restored ({self._get_message_count()} messages).")
 
 
 
@@ -1033,6 +1050,12 @@ class Agent:
             save_session(self.session_id, {
                 "metadata": {
                     "id": self.session_id,
+                    "session_id": self.session_id,
+                    "project_hash": _project_hash(),
+                    "protocol": "openai" if self.use_openai else "anthropic",
+                    "created_at": self.session_start_time,
+                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                    "schema_version": 2,
                     "model": self.model,
                     "cwd": str(Path.cwd()),
                     "startTime": self.session_start_time,

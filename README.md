@@ -31,7 +31,7 @@ flowchart TD
     M -->|完成本轮| F["输出回答并保存主会话"]
 ```
 
-**长任务如何继续。** 模型可以主动调用 `compact_context`，运行时也会在上下文占用超过阈值时触发折叠。折叠后的事件记忆、工作记忆和工具记忆进入当前对话，供下一次推理使用。退出程序后，`--resume` 可以从磁盘恢复最近保存的会话。[折叠结构](agents/session_memory.py) · [会话存储](agents/session.py)
+**长任务如何继续。** 模型可以主动调用 `compact_context`，运行时也会在上下文占用超过阈值时触发折叠。折叠后的事件记忆、工作记忆和工具记忆进入当前对话，供下一次推理使用。退出程序后，`--resume` 按最后更新时间恢复当前项目、当前模型协议的最近会话，并沿用原会话 ID。[折叠结构](agents/session_memory.py) · [会话存储](agents/session.py)
 
 **反馈如何进入下一次任务。** 主 Agent 保留本轮任务和回复。收到下一轮输入后，后台流程可结合反馈提取候选经验，检索已有 Skill，决定新增、合并或丢弃。写入受权限控制，保存的 Skill 可在后续任务中被检索。[在线提取与维护](agents/online_skill_evolution.py) · [版本与来源记录](agents/skill_evolution.py)
 
@@ -105,6 +105,8 @@ MODEL=<模型标识>
 python -m agents.main --plan "阅读当前仓库，找出运行入口、依赖和测试命令，给出复现计划"
 python -m agents.main --resume
 ```
+
+用 `python -m agents.main --resume <session_id>` 可指定快照，ID 取自 `~/.research/sessions/<session_id>.json` 的文件名。旧版快照需要显式指定 ID，CLI 会给出兼容提示；下次保存时写入新版元数据。路径审批和 Web 缓存在新进程中重新建立。要在最近会话中执行一次性任务，可用 `python -m agents.main --resume -- "继续上次的分析"`。
 
 ## 本地 Web 会话
 

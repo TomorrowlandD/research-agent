@@ -404,7 +404,8 @@ class DeepSeekThinkingTests(unittest.IsolatedAsyncioTestCase):
 
 class DeepSeekCliIntegrationTests(unittest.TestCase):
     def test_cli_passes_configuration_and_complete_saved_session_without_loading_env_file(self):
-        session = {"openaiMessages": [], "foldedSessionMemories": [{"session_id": "fake"}]}
+        session = {"metadata": {"project_hash": "project", "protocol": "openai"},
+                   "openaiMessages": [], "foldedSessionMemories": [{"session_id": "fake"}]}
         fake = NS(restore_session=Mock())
         with patch.dict(os.environ, {"APIKEY": "test-placeholder", "API": "https://api.deepseek.com"}, clear=True), \
              patch("sys.argv", ["researchagent", "--model", "deepseek-v4-pro", "--thinking", "--reasoning-effort", "low", "--max-output-tokens", "8000", "--resume"]), \
