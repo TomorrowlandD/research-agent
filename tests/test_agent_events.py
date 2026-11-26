@@ -99,7 +99,8 @@ class AgentEventTests(unittest.TestCase):
                 self.assertEqual(events[-1]["payload"]["memory"], summary)
                 self.assertEqual(events[-1]["payload"]["trigger"], "manual")
                 snapshot = load_session(agent.session_id)
-                self.assertNotIn("original small result", json.dumps(snapshot))
+                self.assertNotIn("original small result 1", json.dumps(snapshot))
+                self.assertIn("original small result 4", json.dumps(snapshot))
                 path = self.sessions / f"{agent.session_id}.events.jsonl"
                 prefix = path.read_bytes()
 

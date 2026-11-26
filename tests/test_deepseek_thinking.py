@@ -293,10 +293,10 @@ class DeepSeekThinkingTests(unittest.IsolatedAsyncioTestCase):
         create = agent._openai_client.chat.completions.create
         create.return_value = side_response(json.dumps(memory))
         with patch("agents.agent.save_folded_session_memory"), patch("agents.agent.fallback_folded_memory") as fallback:
-            self.assertTrue(await agent._compact_openai(trigger="manual"))
+            self.assertTrue(await agent._compact_conversation(trigger="manual"))
             fallback.assert_not_called()
         self.assertEqual(create.call_args.kwargs["extra_body"]["thinking"]["type"], "disabled")
-        self.assertEqual([m["role"] for m in agent._openai_messages], ["system", "user"])
+        self.assertEqual(agent._openai_messages[-1]["reasoning_content"], "thought")
         create.return_value = answer("continued")
         await agent._chat_openai("continue after compact")
         self.assertEqual(create.call_args.kwargs["extra_body"]["thinking"]["type"], "enabled")

@@ -58,9 +58,14 @@ class ToolBatchFoldingTests(unittest.TestCase):
                     if isinstance(summary, str) and summary:
                         read.assert_not_awaited()
                         self.assertEqual(agent._fold_count, 1)
-                        self.assertEqual([m["role"] for m in requests[1]],
-                                         ["system", "user"] if protocol == "openai" else ["user"])
-                        self.assertIn("saved", requests[1][-1]["content"])
+                        rebuilt = requests[1]
+                        self.assertIn("saved", rebuilt[int(protocol == "openai")]["content"])
+                        self.assertIn({"role": "assistant", "content": "ok"}, rebuilt)
+                        for msg in rebuilt:
+                            self.assertNotEqual(msg["role"], "tool")
+                            self.assertFalse(msg.get("tool_calls"))
+                            if isinstance(msg.get("content"), list):
+                                self.assertFalse(any(b["type"] in ("tool_use", "tool_result") for b in msg["content"]))
                     else:
                         read.assert_awaited_once()
                         self.assertEqual(agent._fold_count, 0)

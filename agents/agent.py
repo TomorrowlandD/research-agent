@@ -36,6 +36,10 @@ from agents.prompt import build_system_prompt
 from agents.session_memory import (
     FOLD_COMPONENT_SYSTEMS,
     FOLD_SESSION_MEMORY_SYSTEM,
+    MAX_TAIL_TOKENS,
+    TAIL_WINDOW_FRACTION,
+    append_anthropic_message,
+    select_fold_tail,
     build_anthropic_transcript,
     build_folding_user_prompt,
     build_openai_transcript,
@@ -1122,61 +1126,67 @@ class Agent:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
-    async def _compact_conversation(self, *, trigger: str = "manual")->bool:
-        if not self.enable_folding or self._fold_limit_reached():
-            return False
-        if self.use_openai:
-            compacted = await self._compact_openai(trigger=trigger)
-        else:
-            compacted = await self._compact_anthropic(trigger=trigger)
-        if compacted:
-            print_info("Conversation compacted.")
-        return compacted
-
     def _fold_limit_reached(self) -> bool:
         return self.max_fold_limit is not None and self._fold_count >= self.max_fold_limit
 
-    async def _compact_anthropic(self, *, trigger: str)->bool:
-        messages = self._anthropic_messages
-        pending = messages[-1] if (trigger == "auto" and messages and messages[-1].get("role") == "user"
-                                   and isinstance(messages[-1].get("content"), str)) else None
-        if len(messages) < (3 if trigger == "auto" else 4):
+    async def _compact_conversation(self, *, trigger: str = "manual") -> bool:
+        if not self.enable_folding or self._fold_limit_reached():
             return False
-
-        transcript = build_anthropic_transcript(_sanitize_for_utf8(messages[:-1] if pending else messages))
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        minimum = 3 if not self.use_openai and trigger == "auto" else 4
+        if len(messages) < minimum:
+            return False
+        pending = (messages[-1] if trigger == "auto" and messages[-1].get("role") == "user"
+                   and isinstance(messages[-1].get("content"), str) else None)
+        history = messages[:-1] if pending else messages
+        build_transcript = build_openai_transcript if self.use_openai else build_anthropic_transcript
+        transcript = build_transcript(_sanitize_for_utf8(history))
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
-        self._notify_fold_observer(trigger, transcript, memory)
-        self._record_fold_event()
-        content = format_folded_memory(memory)
-        if pending:
-            content += "\n\n" + pending["content"]
-        self._anthropic_messages = [{"role": "user", "content": content}]
-        self._record_folded_session_memory(trigger, memory, len(messages), int(pending is not None))
-        self._reset_context_budget()
-        self._refresh_runtime_system_prompt()
-        return True
 
-    async def _compact_openai(self, *, trigger: str)->bool:
-        messages = self._openai_messages
-        pending = messages[-1] if (trigger == "auto" and messages and messages[-1].get("role") == "user"
-                                   and isinstance(messages[-1].get("content"), str)) else None
-        if len(messages) < 4:
-            return False
-        system_msg = self._openai_messages[0]
-        transcript = build_openai_transcript(_sanitize_for_utf8(messages[:-1] if pending else messages))
-        if not transcript.strip():
-            return False
+        # Manual compaction in non-thinking mode also upgrades legacy DeepSeek
+        # snapshots for a subsequent thinking-mode resume with tools.
+        require_reasoning = bool(self._deepseek and (self.thinking or trigger == "manual")
+                                 and get_active_tool_definitions(self.tools))
+        # The active compact_context call has no receipt yet, so the complete-
+        # batch check in select_fold_tail excludes it and any sibling receipts.
+        tail_source = history
+        first = int(self.use_openai)
+        if self._folded_session_memories and len(tail_source) > first:
+            previous = tail_source[first]
+            if (previous.get("role") == "user" and isinstance(previous.get("content"), str)
+                    and previous["content"].startswith("<session-folded-memory>")):
+                tail_source = tail_source[first + 1:]
+        tail = select_fold_tail(tail_source, openai=self.use_openai,
+                                budget=min(int(self.effective_window * TAIL_WINDOW_FRACTION), MAX_TAIL_TOKENS),
+                                estimate=self._estimate_tokens, require_reasoning=require_reasoning)
         memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
+        summary = {"role": "user", "content": format_folded_memory(memory)}
+        if self.use_openai:
+            view = [messages[0], summary, *tail]
+            if pending:
+                view.append(pending)
+            self._openai_messages = view
+        else:
+            view = [summary]
+            if tail and tail[0]["role"] == "user":
+                view.append({"role": "assistant", "content": "Understood."})
+            for message in tail:
+                append_anthropic_message(view, message)
+            if pending:
+                append_anthropic_message(view, pending)
+            self._anthropic_messages = view
+        # A tool/threshold fold immediately issues another request. A trailing
+        # assistant answer would otherwise be treated as an assistant prefill.
+        if trigger in ("auto", "tool") and view[-1]["role"] == "assistant":
+            view.append({"role": "user", "content": "Continue the task from the folded session memory."})
+
         self._record_fold_event()
-        self._openai_messages = [system_msg, {"role": "user", "content": format_folded_memory(memory)}]
-        if pending:
-            self._openai_messages.append(pending)
-        self._record_folded_session_memory(trigger, memory, len(messages), int(pending is not None))
+        self._record_folded_session_memory(trigger, memory, len(messages), len(tail), pending is not None)
         self._reset_context_budget()
         self._refresh_runtime_system_prompt()
+        print_info("Conversation compacted.")
         return True
 
     async def _generate_folded_session_memory(self, transcript: str, *, allow_fallback: bool = True) -> dict[str, Any]:
@@ -1227,7 +1237,7 @@ class Agent:
             logging.exception("fold observer failed")
 
     def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any],
-                                      previous_count: int, retained_count: int) -> None:
+                                      previous_count: int, retained_count: int, pending_user: bool) -> None:
         record = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "trigger": trigger,
@@ -1241,8 +1251,8 @@ class Agent:
         self._event_log.record(self.trace_id, "context_fold", {
             "trigger": "threshold" if trigger == "auto" else trigger,
             "pre_fold_message_count": previous_count,
-            "start_index": int(self.use_openai), "end_index_exclusive": previous_count - retained_count,
-            "retained_tail_messages": retained_count, "memory": memory,
+            "start_index": int(self.use_openai), "end_index_exclusive": previous_count - int(pending_user),
+            "retained_tail_messages": retained_count, "pending_user_messages": int(pending_user), "memory": memory,
         })
         self._folded_session_memories.append(record)
         try:
@@ -1987,12 +1997,16 @@ class Agent:
         async def _do():
             max_output = self.max_output_tokens or _get_max_output_tokens(self.model)
 
+            # A new user input may directly follow a manually folded user summary or tool result.
+            wire_messages = []
+            for message in self._anthropic_messages:
+                append_anthropic_message(wire_messages, message)
             create_params: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else (self.max_output_tokens or 16384),
                 "system": _safe_utf8_text(self._system_prompt),
                 "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
-                "messages": _sanitize_for_utf8(self._anthropic_messages),
+                "messages": _sanitize_for_utf8(wire_messages),
             }
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
             if self._thinking_mode  in ("adaptive", "enabled"):

@@ -51,7 +51,8 @@ class FoldingSwitchTests(unittest.TestCase):
         self.assertEqual(agent._fold_count, 1)
         self.assertEqual(agent._folded_session_memories[0]["trigger"], "eval_scheduled")
         self.assertIn("Remember blue", fold_events[0]["transcript"])
-        self.assertEqual(len(agent._openai_messages), 2)
+        self.assertEqual(agent._openai_messages[2:], [{"role": "user", "content": "Remember blue."},
+                                                     {"role": "assistant", "content": "OK"}])
 
     def test_fold_limit_blocks_a_second_fold(self) -> None:
         agent = self._agent(max_fold_limit=1)

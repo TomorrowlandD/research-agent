@@ -183,7 +183,7 @@ class DeepSeekConfigTests(unittest.TestCase):
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(memory)))], usage=None,
         )
         with patch("agents.agent.save_folded_session_memory"), patch("agents.agent.fallback_folded_memory") as fallback:
-            self.assertTrue(asyncio.run(agent._compact_openai(trigger="manual")))
+            self.assertTrue(asyncio.run(agent._compact_conversation(trigger="manual")))
             fallback.assert_not_called()
         self.assertIn("Remember blue", agent._openai_messages[-1]["content"])
         self.assertEqual(create.call_args.kwargs["extra_body"], {"thinking": {"type": "disabled"}})

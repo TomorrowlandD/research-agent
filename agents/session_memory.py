@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 
@@ -99,6 +100,133 @@ def _content_text(content: Any) -> str:
                 parts.append(str(block.get("content") or ""))
         return "\n".join(p for p in parts if p)
     return ""
+
+
+# Budget is independent of the summary and any as-yet unanswered input.
+TAIL_WINDOW_FRACTION = 0.15
+MAX_TAIL_TOKENS = 12_000
+
+
+def _plain_text(message: dict) -> bool:
+    content = message.get("content")
+    if message.get("tool_calls"):
+        return False
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and bool(content) and all(
+        isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) for b in content
+    )
+
+
+def _closed_tool_batch(messages: list[dict], index: int, openai: bool) -> int:
+    """Return the exclusive end of a complete call/result batch, or its start."""
+    assistant = messages[index]
+    if openai:
+        calls = assistant.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            return index
+        if any(not isinstance(c, dict) or c.get("type") != "function" or not isinstance(c.get("function"), dict)
+               or not c["function"].get("name") or not isinstance(c["function"].get("arguments"), str) for c in calls):
+            return index
+        ids = [c.get("id") for c in calls]
+        end = index + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        results = [m.get("tool_call_id") for m in messages[index + 1:end]]
+    else:
+        blocks = assistant.get("content")
+        if not isinstance(blocks, list) or index + 1 >= len(messages):
+            return index
+        if not all(isinstance(b, dict) for b in blocks):
+            return index
+        calls = [b for b in blocks if b.get("type") == "tool_use"]
+        if any(not isinstance(c.get("input"), dict) or not c.get("name") for c in calls):
+            return index
+        ids = [c.get("id") for c in calls]
+        reply = messages[index + 1]
+        blocks = reply.get("content")
+        if reply.get("role") != "user" or not isinstance(blocks, list):
+            return index
+        results = []
+        # Messages accepts result blocks first, optionally followed by text.
+        for b in blocks:
+            if not isinstance(b, dict):
+                return index
+            if b.get("type") != "tool_result":
+                break
+            results.append(b.get("tool_use_id"))
+        if any(not isinstance(b, dict) or b.get("type") != "text" for b in blocks[len(results):]):
+            return index
+        end = index + 2
+    if not ids or not all(isinstance(x, str) and x for x in ids + results):
+        return index
+    if len(ids) != len(set(ids)) or len(results) != len(ids) or set(results) != set(ids):
+        return index
+    return end
+
+
+def select_fold_tail(messages: list[dict], *, openai: bool, budget: int,
+                     estimate: Callable[[dict], int], require_reasoning: bool = False) -> list[dict]:
+    """Keep the most recent budgeted whole units in their original order."""
+    units = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role")
+        if (role == "user" and _plain_text(msg) and i + 1 < len(messages)
+                and messages[i + 1].get("role") == "assistant" and _plain_text(messages[i + 1])):
+            end = i + 2
+        elif role == "assistant":
+            end = _closed_tool_batch(messages, i, openai)
+            if end == i:
+                i += 1
+                continue
+            # The assistant's final answer after tool results is part of the exchange.
+            if end < len(messages) and messages[end].get("role") == "assistant" and _plain_text(messages[end]):
+                end += 1
+        else:
+            i += 1
+            continue
+        # The user input that initiated a tool batch may contain the only
+        # exact path or constraint. Keep it too when the batch leaves room.
+        opener = (i - 1 if role == "assistant" and i > 0 and messages[i - 1].get("role") == "user"
+                  and _plain_text(messages[i - 1]) else None)
+        units.append((i, end, opener))
+        i = end
+
+    retained = []
+    for start, end, opener in reversed(units):
+        unit = messages[start:end]
+        if require_reasoning and any(m["role"] == "assistant" and not isinstance(m.get("reasoning_content"), str)
+                                     for m in unit):
+            break
+        cost = sum(estimate(m) for m in unit)
+        if cost > budget:
+            break
+        budget -= cost
+        retained.append(unit)
+        if opener is not None:
+            cost = estimate(messages[opener])
+            if cost > budget:
+                break
+            budget -= cost
+            retained.append([messages[opener]])
+    return [message for unit in reversed(retained) for message in unit]
+
+
+def append_anthropic_message(view: list[dict], message: dict) -> None:
+    """Join adjacent same-role content without editing original messages or blocks."""
+    if not view or view[-1]["role"] != message["role"]:
+        view.append(message)
+        return
+    first, second = view[-1]["content"], message["content"]
+    if isinstance(first, str) and isinstance(second, str):
+        content = first + "\n\n" + second
+    else:
+        def blocks(value):
+            return [{"type": "text", "text": value}] if isinstance(value, str) else value
+        content = [*blocks(first), *blocks(second)]
+    view[-1] = {"role": message["role"], "content": content}
 
 
 def build_openai_transcript(messages: list[dict[str, Any]]) -> str:
