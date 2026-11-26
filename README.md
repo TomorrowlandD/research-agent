@@ -139,6 +139,8 @@ python -m agents.web --idle-timeout 300
 
 主 Agent 和 `explore` 子 Agent 共享当前会话的成功搜索、抓取结果，TTL 为 30 分钟。Trace 的 `cache_hit` 可区分复用与实际请求。浏览器操作每次执行。遇到需要点击或动态渲染的页面，主 Agent 可以把 URL 与要核实的问题交给 `explore`。
 
+`web_search` 把显示的候选项写入当前项目的 `.research/artifacts/<session_id>/candidates.jsonl`。主 Agent 可用 `update_candidate_status(canonical_id, status, reason)` 把条目标为 `candidate`、`selected` 或 `rejected`，用 `list_candidates(status?)` 查看对应条目和完整理由。再次命中时，搜索结果会附上当前状态和理由预览，已淘汰条目仍可重新选择。即使命中搜索缓存，状态也从当前会话的账本读取。用 `--resume` 恢复原会话后可以继续筛选。
+
 ## MCP 启动与工具日志
 
 先在运行 CLI 的环境中安装 Node.js，确认 `node` 和 `npx` 均在 PATH 上。WSL 使用 Linux 的 Node.js。项目配置通过 PATH 解析 Context7 和 Playwright 的启动命令。Playwright MCP 固定为 `0.0.86`，使用独立的无头 Chromium，并关闭图片回传。首次运行前，可在同一用户环境中安装配套浏览器和 Linux 运行库。

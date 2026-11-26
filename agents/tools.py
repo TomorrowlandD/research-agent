@@ -8,6 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from .artifacts import DECISIONS, STATUSES
 from .paths import RESEARCH_DIRNAME
 from .tool_result import ToolFailure
 from .web_tools import normalize_web_args, web_fetch, web_search
@@ -45,8 +46,8 @@ def validate_tool_arguments(name: str, arguments: object, tools: list[ToolDef], 
 #权限模式
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
 
-READ_TOOLS = {"web_search", "web_fetch", "read_file", "list_files", "grep_search", "compact_context"}
-EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
+READ_TOOLS = {"list_candidates", "web_search", "web_fetch", "read_file", "list_files", "grep_search", "compact_context"}
+EDIT_TOOLS = {"update_candidate_status", "write_file", "edit_file", "skill_evolve", "skill_create"}
 
 
 #并发安全的工具可以并行运行（只读，无副作用）
@@ -77,6 +78,22 @@ tool_definitions: list[ToolDef] = [
         "input_schema": {"type": "object", "required": ["query"], "properties": {
             "query": {"type": "string", "minLength": 1},
             "max_results": {"type": "integer", "description": "Default 5, clamped to 1–10."},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "update_candidate_status",
+        "description": "Set the screening decision and reason for a known search candidate in this session.",
+        "input_schema": {"type": "object", "required": ["canonical_id", "status", "reason"], "properties": {
+            "canonical_id": {"type": "string", "minLength": 1},
+            "status": {"type": "string", "enum": list(DECISIONS)},
+            "reason": {"type": "string", "minLength": 1},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "list_candidates",
+        "description": "List candidates and screening reasons from this session, optionally filtering by status.",
+        "input_schema": {"type": "object", "properties": {
+            "status": {"type": "string", "enum": list(STATUSES)},
         }, "additionalProperties": False},
     },
     {

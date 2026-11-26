@@ -15,7 +15,8 @@ from pathlib import Path
 from .paths import RESEARCH_DIRNAME
 from .tool_result import ToolExecutionResult, ToolFailure
 from .web_cache import WebCache
-from .web_tools import external_content, normalize_web_args
+from .artifacts import CandidateLedger
+from .web_tools import annotate_search_results, external_content, fetch_search_results, normalize_web_args
 from .tool_snapshot import replay_tool_snapshot, write_tool_snapshot
 from dataclasses import replace
 from types import SimpleNamespace
@@ -250,6 +251,7 @@ class Agent:
         self.effective_window = (CONTEXT_WINDOW - max_output_tokens - 20000
                                  if self._deepseek else _get_context_windows(model) - 20000)
         self.session_id = uuid.uuid4().hex[:8]
+        self._candidate_ledger = CandidateLedger(Path.cwd(), self.session_id)
         self._event_log = SessionEventLog(self.session_id, "openai" if self.use_openai else "anthropic")
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
@@ -995,6 +997,7 @@ class Agent:
             self._folded_session_memories = _sanitize_for_utf8(data["foldedSessionMemories"])
         if session_id is not None:
             self.session_id = session_id
+            self._candidate_ledger = CandidateLedger(Path.cwd(), session_id)
             self.session_start_time = metadata.get("created_at") or metadata.get("startTime") or self.session_start_time
             if self.permission_mode == "plan":
                 self._plan_file_path = self._generate_plan_file_path()
@@ -1484,6 +1487,8 @@ class Agent:
                 result = replay_tool_snapshot(self._replay_snapshot, name, inp)
             elif is_web_tool:
                 result = await self._web_cache.execute(name, inp, self._dispatch_tool)
+                if name == "web_search" and result.ok:
+                    result = await asyncio.to_thread(annotate_search_results, result, self._candidate_ledger)
             else:
                 raw = await self._dispatch_tool(name, inp)
                 result = raw if isinstance(raw, ToolExecutionResult) else ToolExecutionResult(raw)
@@ -1521,6 +1526,14 @@ class Agent:
             logging.warning("Cannot write tool trace: %s", exc)
 
     async def _dispatch_tool(self, name: str, inp: dict) -> str | ToolExecutionResult:
+        if name == "web_search":
+            return await fetch_search_results(**inp)
+        if name == "update_candidate_status":
+            row = await asyncio.to_thread(self._candidate_ledger.update, **inp)
+            return json.dumps(row, ensure_ascii=False)
+        if name == "list_candidates":
+            rows = await asyncio.to_thread(self._candidate_ledger.list_candidates, **inp)
+            return json.dumps(rows, ensure_ascii=False)
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):

@@ -1,5 +1,6 @@
 """Offline contract tests for the P1 web tools, session cache and role mounts."""
 import asyncio
+from contextlib import chdir
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ class WebRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
         self.enterContext(patch("pathlib.Path.home", return_value=self.home))
+        self.enterContext(chdir(self.home))
         self.agent = Agent(api_base="http://example.invalid", api_key="placeholder",
                            custom_system_prompt="test", enable_mcp=False)
 
@@ -60,7 +62,9 @@ class WebRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 first = await self.agent._execute_tool_call("web_search", args)
                 second = await self.agent._execute_tool_call("web_search", {**args, "query": "study"})
                 self.assertTrue(first.ok, first.content)
-                self.assertEqual(first.content, second.content)
+                self.assertIn("首次记录", first.content)
+                self.assertIn("历史已记录", second.content)
+                self.assertNotIn("首次记录", second.content)
                 self.assertLessEqual(len(first.content), 4000)
                 body = ElementTree.fromstring(first.content).text
                 self.assertIn("x" * 600, body)

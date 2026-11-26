@@ -1,12 +1,14 @@
 """Async search providers and static document retrieval for the research runtime."""
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape
+import logging
 import os
 
 import httpx
 
-from .tool_result import ToolFailure
+from .artifacts import CandidateLedger, candidate_label, canonical_id
+from .tool_result import ToolExecutionResult, ToolFailure
 
 
 def external_content(source: str, text: str) -> str:
@@ -68,26 +70,85 @@ def normalize_web_args(name: str, args: dict) -> dict:
     return {"url": str(url.copy_with(fragment=None))}
 
 
-async def web_search(query: str, max_results: int) -> str:
+async def fetch_search_results(query: str, max_results: int) -> ToolExecutionResult:
     provider = search_provider()
     try:
         async with asyncio.timeout(15), httpx.AsyncClient(timeout=15) as client:
             rows = await provider.search(client, query, max(1, min(10, max_results)))
     except (TimeoutError, httpx.TimeoutException) as exc:
         raise TimeoutError("web_search request timed out.") from exc
+    hits = []
     entries = []
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get(provider.url_field), str):
             continue
         url = row[provider.url_field]
-        if not url.startswith(("http://", "https://")):
+        try:
+            key = canonical_id(url)
+        except ValueError:
             continue
         title = str(row.get("title") or "")[:200]
         snippet = str(row.get(provider.snippet_field) or "")[:600]
         entry = f"{title}\n{url}\n{snippet}"
         if len(external_content(provider.name, "\n\n".join([*entries, entry]))) <= 4000:
             entries.append(entry)
-    return external_content(provider.name, "\n\n".join(entries) or "No displayable search results.")
+            hits.append({"title": title, "url": url, "snippet": snippet, "canonical_id": key})
+    content = external_content(provider.name, "\n\n".join(entries) or "No displayable search results.")
+    return ToolExecutionResult(content, meta={"search_provider": provider.name, "search_hits": hits})
+
+
+async def web_search(query: str, max_results: int) -> str:
+    return (await fetch_search_results(query, max_results)).content
+
+
+def _fit_text(text: str, space: int) -> str:
+    """Fit text inside the escaped XML character budget without cutting an entity."""
+    if len(escape(text, quote=False)) <= space:
+        return text
+    size = 0
+    for index, char in enumerate(text):
+        size += len(escape(char, quote=False))
+        if size >= space:
+            return text[:index] + "…" if space else ""
+    return text
+
+
+def annotate_search_results(result: ToolExecutionResult, ledger: CandidateLedger) -> ToolExecutionResult:
+    meta = dict(result.meta)
+    hits = meta.pop("search_hits")
+    provider = meta.pop("search_provider")
+    # Select by rank and size before looking up status. Updating a decision
+    # should never remove a hit from the result or mark an unseen hit as seen.
+    space = 4000 - len(external_content(provider, ""))
+    displayed = []
+    for hit in hits:
+        key = hit["canonical_id"]
+        heading = f"{hit['title']}\n{hit['url']}\n"
+        # Reserve the longest status, a bounded escaped reason, and a separator.
+        longest = f"[历史已记录 | {key} | 状态: candidate | 原因: ]"
+        reserved = len(escape(heading + longest, quote=False)) + 160 + 2
+        if reserved <= space:
+            space -= reserved
+            displayed.append((hit, heading))
+    try:
+        observed = ledger.observe([hit for hit, _ in displayed])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logging.warning("Candidate ledger unavailable at %s: %s", ledger.path, exc)
+        return replace(result, meta={**meta, "ledger_warning": str(exc)})
+    entries = []
+    for (hit, heading), (record, known) in zip(displayed, observed):
+        label = candidate_label({**record, "reason": _fit_text(record["reason"], 160)}, known)
+        entries.append((heading + label, hit["snippet"]))
+    body = []
+    space = 4000 - len(external_content(provider, "\n\n".join(heading for heading, _ in entries)))
+    for heading, snippet in entries:
+        preview = _fit_text(snippet, max(0, space - 1))
+        if preview:
+            heading += "\n" + preview
+            space -= 1 + len(escape(preview, quote=False))
+        body.append(heading)
+    return replace(result, content=external_content(provider, "\n\n".join(body) or "No displayable search results."),
+                   meta=meta)
 
 
 def extract_page(body: bytes, source: str) -> str:
