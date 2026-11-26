@@ -1074,7 +1074,7 @@ class Agent:
         transcript = build_anthropic_transcript(_sanitize_for_utf8(self._anthropic_messages))
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript)
+        memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
@@ -1090,7 +1090,7 @@ class Agent:
         transcript = build_openai_transcript(_sanitize_for_utf8(self._openai_messages))
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript)
+        memory = await self._generate_folded_session_memory(transcript, allow_fallback=trigger != "tool")
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
@@ -1102,11 +1102,16 @@ class Agent:
         self._refresh_runtime_system_prompt()
         return True
 
-    async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
+    async def _generate_folded_session_memory(self, transcript: str, *, allow_fallback: bool = True) -> dict[str, Any]:
+        def fallback():
+            if not allow_fallback:
+                raise ToolFailure("Context compaction failed to generate a summary. Conversation history was preserved.")
+            return fallback_folded_memory(transcript)
+
         if self.fold_memory_mode == "three_parallel":
             side_query = self._build_side_query(max_tokens=2500)
             if side_query is None:
-                return fallback_folded_memory(transcript)
+                return fallback()
             prompt = "Extract the requested memory from this conversation.\n\nConversation transcript:\n" + transcript
             names = tuple(FOLD_COMPONENT_SYSTEMS)
             results = await asyncio.gather(
@@ -1115,20 +1120,20 @@ class Agent:
             )
             if any(isinstance(result, BaseException) for result in results):
                 logging.warning("parallel fold memory generation failed; preserving transcript in fallback memory")
-                return fallback_folded_memory(transcript)
+                return fallback()
             try:
                 return {name: parse_fold_component(name, raw) for name, raw in zip(names, results)}
             except (ValueError, TypeError, json.JSONDecodeError):
                 logging.warning("parallel fold memory response was malformed; preserving transcript in fallback memory")
-                return fallback_folded_memory(transcript)
+                return fallback()
         side_query = self._build_side_query(max_tokens=6000)
         if side_query is None:
-            return fallback_folded_memory(transcript)
+            return fallback()
         try:
             raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript))
             return parse_folded_memory(raw)
         except Exception:
-            return fallback_folded_memory(transcript)
+            return fallback()
 
     def _notify_fold_observer(self, trigger: str, transcript: str, memory: dict[str, Any]) -> None:
         if self.fold_observer is None:
@@ -1428,7 +1433,7 @@ class Agent:
                 pass
         return result
 
-    async def _execute_compact_context_tool(self, inp: dict) -> str:
+    async def _execute_compact_context_tool(self, inp: dict) -> ToolExecutionResult:
         if not self.enable_folding:
             raise ToolFailure("Context folding is disabled for this run. Continue without compacting.")
         if self._fold_limit_reached():
@@ -1437,12 +1442,11 @@ class Agent:
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
             raise ToolFailure("No context compaction was performed because there is not enough conversation history yet.")
-        self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
-        return (
+        return ToolExecutionResult(
             "Context compacted into structured session memory. "
             "Continue from the folded memory now present in the conversation context."
-            f"{suffix}"
+            f"{suffix}", meta={"compacted": True},
         )
 
 
@@ -1830,6 +1834,10 @@ class Agent:
                 print_tool_result(tu.name, res)
                 self._record_tool_outcome(tu.name, outcome.ok)
 
+                if tu.name == "compact_context" and self.tool_mode != "replay" and outcome.meta.get("compacted"):
+                    context_break = True
+                    break
+
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
                     # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
@@ -2114,6 +2122,10 @@ class Agent:
                             print_tool_result(ct["fn"], res)
                             self._record_tool_outcome(ct["fn"], outcome.ok)
 
+                            if ct["fn"] == "compact_context" and self.tool_mode != "replay" and outcome.meta.get("compacted"):
+                                oai_context_break = True
+                                break
+
                             if self._context_cleared:
                                 self._context_cleared = False
                                 self._openai_messages.append({"role": "user", "content": res})
@@ -2126,13 +2138,8 @@ class Agent:
                 self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
                 raise
 
-            if self._aborted:
+            if self._aborted and not oai_context_break:
                 self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
-            elif oai_context_break:
-                self._append_openai_skipped_tool_results(
-                    tool_calls,
-                    "Tool execution skipped because the conversation context was reset.",
-                )
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
