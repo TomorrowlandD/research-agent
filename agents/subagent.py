@@ -85,22 +85,22 @@ Guidelines:
 # ─── Custom agent discovery ─────────────────────────────────
 
 # 自定义代理发现结果的进程内缓存；读取 .research/agents/*.md 后会复用，避免每次调用 agent 工具都扫目录。
-_cached_custom_agents: dict[str, dict] | None = None
+_cached_custom_agents: dict[Path, dict[str, dict]] = {}
 
 
 def _discover_custom_agents() -> dict[str, dict]:
     """发现用户级和项目级自定义代理，并按代理名称返回配置。"""
-    global _cached_custom_agents
-    if _cached_custom_agents is not None:
-        return _cached_custom_agents
+    project = workspace_dir().resolve()
+    if project in _cached_custom_agents:
+        return _cached_custom_agents[project]
 
     agents: dict[str, dict] = {}
     # User-level (lower priority)
     _load_agents_from_dir(Path.home() / RESEARCH_DIRNAME / "agents", agents)
     # Project-level (higher priority, overwrites)
-    _load_agents_from_dir(workspace_dir() / RESEARCH_DIRNAME / "agents", agents)
+    _load_agents_from_dir(project / RESEARCH_DIRNAME / "agents", agents)
 
-    _cached_custom_agents = agents
+    _cached_custom_agents[project] = agents
     return agents
 
 
@@ -187,5 +187,4 @@ def build_agent_descriptions() -> str:
 
 def reset_agent_cache() -> None:
     """清空自定义代理缓存；测试或运行中刷新 .research/agents 配置时使用。"""
-    global _cached_custom_agents
-    _cached_custom_agents = None
+    _cached_custom_agents.pop(workspace_dir().resolve(), None)

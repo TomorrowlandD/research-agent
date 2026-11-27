@@ -13,7 +13,7 @@ from .paths import RESEARCH_DIRNAME, workspace_dir
 from .memory import build_memory_prompt_section
 from .skills import build_skill_descriptions
 from .subagent import build_agent_descriptions
-from .tools import get_deferred_tool_names
+from .tools import ToolDef, get_deferred_tool_names
 
 # ─── System prompt template (embedded) ──────────────────────
 
@@ -200,7 +200,7 @@ def load_claude_md() -> str:
 def get_git_context() -> str:
     """Get git branch, recent commits, and status."""
     try:
-        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
+        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True, "cwd": workspace_dir()}
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
         log = subprocess.run(["git", "log", "--oneline", "-5"], **opts).stdout.strip()
         status = subprocess.run(["git", "status", "--short"], **opts).stdout.strip()
@@ -214,7 +214,9 @@ def get_git_context() -> str:
         return ""
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(
+    tools: list[ToolDef] | None = None, activated_tools: set[str] | None = None,
+) -> str:
     """Build the full system prompt from embedded template + dynamic context."""
     from datetime import date
     today = date.today().isoformat()
@@ -226,7 +228,7 @@ def build_system_prompt() -> str:
     skills_section = build_skill_descriptions()
     agent_section = build_agent_descriptions()
 
-    deferred_names = get_deferred_tool_names()
+    deferred_names = get_deferred_tool_names(tools, activated_tools or frozenset())
     deferred_section = (
         f"\n\nThe following deferred tools are available via tool_search: {', '.join(deferred_names)}. Use tool_search to fetch their full schemas when needed."
         if deferred_names else ""

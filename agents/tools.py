@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Set
 from pathlib import Path
 
 from .artifacts import DECISIONS, STATUSES
@@ -59,18 +60,6 @@ CONCURRENCY_SAFE_TOOLS = {"web_search", "web_fetch", "read_file", "list_files", 
 
 
 
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
-
-
-
-#工具定义
 tool_definitions: list[ToolDef] = [
     {
         "name": "web_search",
@@ -565,24 +554,21 @@ def _truncate_result(result:str) -> str:
 
 
 #----------延迟工具激活---------------------------
-_activated_tools: set[str] = set()
-
-
-
-def reset_activated_tools() -> None:
-    _activated_tools.clear()
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
+def get_active_tool_definitions(
+    all_tools: list[ToolDef] | None = None, activated_tools: Set[str] = frozenset(),
+) -> list[ToolDef]:
     tools = all_tools if all_tools is not None else tool_definitions
     return [
         {k: v for k, v in t.items() if k != "deferred"}
         for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
+        if not t.get("deferred") or t["name"] in activated_tools
     ]
 
-def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
+def get_deferred_tool_names(
+    all_tools: list[ToolDef] | None = None, activated_tools: Set[str] = frozenset(),
+) -> list[str]:
     tools = all_tools if all_tools is not None else tool_definitions
-    return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
+    return [t["name"] for t in tools if t.get("deferred") and t["name"] not in activated_tools]
 
 #执行shell命令
 def _run_shell(inp: dict) -> str:
@@ -649,20 +635,20 @@ def _load_settings(file_path: Path) -> dict | None:
     except Exception:
         return None
 
-_cached_rules: dict | None = None
+_cached_rules: dict[Path, dict] = {}
 
 
 
 def load_permission_rules() -> dict:
-    global _cached_rules
-    if _cached_rules is not None:
-        return _cached_rules
+    project = workspace_dir().resolve()
+    if project in _cached_rules:
+        return _cached_rules[project]
 
     allow: list[dict] = []
     deny: list[dict] = []
 
     user_settings = _load_settings(Path.home() / RESEARCH_DIRNAME / "settings.json")
-    project_settings = _load_settings(workspace_dir() / RESEARCH_DIRNAME / "settings.json")
+    project_settings = _load_settings(project / RESEARCH_DIRNAME / "settings.json")
 
     for settings in [user_settings, project_settings]:
         if not settings or "permissions" not in settings:
@@ -673,8 +659,8 @@ def load_permission_rules() -> dict:
         for r in perms.get("deny", []):
             deny.append(_parse_rule(r))
 
-    _cached_rules = {"allow": allow, "deny": deny}
-    return _cached_rules
+    _cached_rules[project] = {"allow": allow, "deny": deny}
+    return _cached_rules[project]
 
 
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
@@ -787,7 +773,8 @@ def check_permission(
 # 'agent' 和 'skill' 这两个工具在 agent.py 中处理，以避免循环依赖。"
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None, *,
+    available_tools: list[ToolDef] | None = None, activated_tools: set[str] | None = None,
 ) -> str:
     if name == "web_search":
         return await web_search(**normalize_web_args(name, inp))
@@ -816,16 +803,16 @@ async def execute_tool(
     #搜索和激活延迟加载的工具。
     if name == "tool_search":
         query = (inp.get("query") or "").lower()
-        deferred = [t for t in tool_definitions if t.get("deferred")]
+        tools = tool_definitions if available_tools is None else available_tools
         matches = [
-            t for t in deferred
-            if query in t["name"].lower() or query in (t.get("description") or "").lower()
+            t for t in tools if t.get("deferred")
+            and (query in t["name"].lower() or query in (t.get("description") or "").lower())
         ]
         if not matches:
             return "No matching deferred tools found."
 
-        for m in matches:
-            _activated_tools.add(m["name"])
+        if activated_tools is not None:
+            activated_tools.update(tool["name"] for tool in matches)
 
         return json.dumps(
             [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["input_schema"]} for t in
@@ -892,7 +879,6 @@ async def execute_tool(
 
 
 def reset_permission_cache() -> None:
-    global _cached_rules
-    _cached_rules = None
+    _cached_rules.pop(workspace_dir().resolve(), None)
 
 

@@ -154,11 +154,14 @@ class McpConnection:
                 self._owner_scope = scope
                 env = {**os.environ, **self.env}
                 command = self.command
+                cwd = workspace_dir()
+                if os.path.dirname(command) and not os.path.isabs(command):
+                    command = str(cwd / command)
                 if not os.path.isabs(command):
                     command = shutil.which(command, path=env.get("PATH"))
                     if command is None:
                         raise FileNotFoundError(f"Command not found: {self.command}")
-                params = StdioServerParameters(command=command, args=self.args, env=env)
+                params = StdioServerParameters(command=command, args=self.args, env=env, cwd=cwd)
                 log_dir = Path.home() / RESEARCH_DIRNAME / "logs"
                 log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 log_path = log_dir / f"mcp-{quote(self.server_name, safe='')}.stderr.log"

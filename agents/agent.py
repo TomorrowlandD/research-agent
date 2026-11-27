@@ -240,6 +240,7 @@ class Agent:
         self.enable_online_evolution = enable_online_evolution
         self.fold_observer = fold_observer
         available_tools = tool_definitions if custom_tools is None else custom_tools
+        self._activated_tools: set[str] = set()
         self.tools = [tool for tool in available_tools if not tool["name"].startswith("mcp__")
                       and (enable_folding or tool["name"] != "compact_context")]
         self.max_cost_usd = max_cost_usd
@@ -317,7 +318,7 @@ class Agent:
         self._last_tool_name: str = ""
 
         #构建系统提示词
-        self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        self._base_system_prompt = custom_system_prompt or build_system_prompt(self.tools, self._activated_tools)
 
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
@@ -341,11 +342,14 @@ class Agent:
 
         self._refresh_runtime_system_prompt()
 
+    def _active_tool_definitions(self) -> list[ToolDef]:
+        return get_active_tool_definitions(self.tools, self._activated_tools)
+
     def _resolve_openai_request_options(self) -> dict[str, Any]:
         return self._deepseek.request_options() if self._deepseek else {}
 
     def _validate_deepseek_history(self, messages: list[dict]) -> None:
-        if self._deepseek and self.thinking and get_active_tool_definitions(self.tools):
+        if self._deepseek and self.thinking and self._active_tool_definitions():
             for message in messages:
                 if message.get("role") == "assistant" and not isinstance(message.get("reasoning_content"), str):
                     raise ValueError(
@@ -693,7 +697,7 @@ class Agent:
     def _refresh_runtime_system_prompt(self) -> None:
         if self._custom_system_prompt is not None:
             return
-        self._base_system_prompt = build_system_prompt()
+        self._base_system_prompt = build_system_prompt(self.tools, self._activated_tools)
         if self.permission_mode == "plan":
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
@@ -996,6 +1000,8 @@ class Agent:
         if isinstance(data.get("foldedSessionMemories"), list):
             self._folded_session_memories = _sanitize_for_utf8(data["foldedSessionMemories"])
         if session_id is not None:
+            if session_id != self.session_id:
+                self._activated_tools.clear()
             self.session_id = session_id
             self._candidate_ledger = CandidateLedger(workspace_dir(), session_id)
             self.session_start_time = metadata.get("created_at") or metadata.get("startTime") or self.session_start_time
@@ -1118,7 +1124,7 @@ class Agent:
         messages = self._openai_messages if self.use_openai else self._anthropic_messages
         estimate = self.last_input_token_count
         if not self.last_accounted_msg_index:
-            tools = get_active_tool_definitions(self.tools)
+            tools = self._active_tool_definitions()
             estimate += self._estimate_tokens(_to_openai_tools(tools) if self.use_openai else tools)
             if not self.use_openai:
                 estimate += self._estimate_tokens(self._system_prompt)
@@ -1150,7 +1156,7 @@ class Agent:
         # Manual compaction in non-thinking mode also upgrades legacy DeepSeek
         # snapshots for a subsequent thinking-mode resume with tools.
         require_reasoning = bool(self._deepseek and (self.thinking or trigger == "manual")
-                                 and get_active_tool_definitions(self.tools))
+                                 and self._active_tool_definitions())
         # The active compact_context call has no receipt yet, so the complete-
         # batch check in select_fold_tail excludes it and any sibling receipts.
         tail_source = history
@@ -1547,7 +1553,9 @@ class Agent:
             if name.split("__", 2)[-1].startswith("browser_"):
                 return replace(result, content=external_content(name, result.content))
             return result
-        result = await execute_tool(name, inp, self._read_file_state)
+        result = await execute_tool(
+            name, inp, self._read_file_state, available_tools=self.tools, activated_tools=self._activated_tools,
+        )
         if name == "read_file" and ".playwright-mcp" in Path(inp["file_path"]).parts:
             return external_content(inp["file_path"], result)
         if name in {"skill_create", "skill_evolve"}:
@@ -2018,7 +2026,7 @@ class Agent:
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else (self.max_output_tokens or 16384),
                 "system": _safe_utf8_text(self._system_prompt),
-                "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
+                "tools": _sanitize_for_utf8(self._active_tool_definitions()),
                 "messages": _sanitize_for_utf8(wire_messages),
             }
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
@@ -2324,7 +2332,7 @@ class Agent:
             self._validate_deepseek_history(self._openai_messages)
             create_params = dict(
                 model=self.model,
-                tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
+                tools=_sanitize_for_utf8(_to_openai_tools(self._active_tool_definitions())),
                 messages=_sanitize_for_utf8(self._openai_messages),
                 stream=True,
                 stream_options={"include_usage": True},

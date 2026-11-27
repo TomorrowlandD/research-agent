@@ -8,7 +8,7 @@ import time
 import hashlib
 from pathlib import Path
 
-from .paths import RESEARCH_DIRNAME
+from .paths import RESEARCH_DIRNAME, workspace_dir
 from typing import Any
 
 from .frontmatter import format_frontmatter, parse_frontmatter
@@ -22,7 +22,7 @@ HISTORY_DIR = "history"
 
 
 def get_evolution_dir() -> Path:
-    return Path.cwd() / RESEARCH_DIRNAME / "skill-evolution"
+    return workspace_dir() / RESEARCH_DIRNAME / "skill-evolution"
 
 
 def _utc_now() -> str:
@@ -235,7 +235,7 @@ def resolve_skill_file(skill_name: str, *, target: str = "active", active_dir: s
             return skill_file
 
     if target in ("project", "active"):
-        found = _find_skill_file_by_name(Path.cwd() / RESEARCH_DIRNAME / "skills", skill_name)
+        found = _find_skill_file_by_name(workspace_dir() / RESEARCH_DIRNAME / "skills", skill_name)
         if found:
             return found
 
@@ -251,7 +251,7 @@ def _skills_root(target: str) -> Path:
     target = (target or "project").strip().lower()
     if target == "user":
         return Path.home() / RESEARCH_DIRNAME / "skills"
-    return Path.cwd() / RESEARCH_DIRNAME / "skills"
+    return workspace_dir() / RESEARCH_DIRNAME / "skills"
 
 
 def _normalize_context(context: str | None) -> str:

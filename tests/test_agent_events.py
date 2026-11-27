@@ -55,7 +55,7 @@ class AgentEventTests(unittest.TestCase):
                 calls = [(str(i), {"file_path": str(i)}) for i in range(5)]
                 calls.append(("invalid", {}))
 
-                async def read(name, args, state):
+                async def read(name, args, state, **kwargs):
                     return big if args["file_path"] == "0" else "original small result " + args["file_path"]
 
                 summary = {"episode_memory": {"current_progress": "saved"},

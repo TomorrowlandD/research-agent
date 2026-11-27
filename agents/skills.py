@@ -37,7 +37,7 @@ class SkillDefinition:
 
 
 # skills 只在首次读取时扫描磁盘，后续复用缓存；修改 skill 后需要重启或 reset。
-_cached_skills: list[SkillDefinition] | None = None
+_cached_skills: dict[Path, list[SkillDefinition]] = {}
 
 
 def execute_skill(skill_name:str, args:object)-> dict | None:
@@ -80,20 +80,20 @@ def get_skill_by_name(skill_name:str)->SkillDefinition | None:
     return None
 
 def discover_skills() -> list[SkillDefinition]:
-    global _cached_skills
-    if _cached_skills is not None:
-        return _cached_skills
+    project = workspace_dir().resolve()
+    if project in _cached_skills:
+        return _cached_skills[project]
 
     skills: dict[str,SkillDefinition] = {}
     # 用户级 skills 优先级最高：~/.research/skills/<name>/SKILL.md
     user_dir = Path.home() / RESEARCH_DIRNAME / "skills"
     _load_skills_from_dir(user_dir, "user", skills)
     # 项目级 skills 优先级较低：<cwd>/.research/skills/<name>/SKILL.md
-    project_dir = workspace_dir() / RESEARCH_DIRNAME / "skills"
+    project_dir = project / RESEARCH_DIRNAME / "skills"
     _load_skills_from_dir(project_dir, "project", skills, overwrite=False)
 
-    _cached_skills = list(skills.values())
-    return _cached_skills
+    _cached_skills[project] = list(skills.values())
+    return _cached_skills[project]
 
 def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDefinition], overwrite: bool = True) -> None:
     # 只加载目录形式的 skill，不加载 .research/skills/foo.md 这种单文件形式。
@@ -338,8 +338,7 @@ def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, 
 
 def reset_skill_cache() -> None:
     # 测试或运行中刷新 skills 时使用；普通用户通常重启程序即可。
-    global _cached_skills
-    _cached_skills = None
+    _cached_skills.pop(workspace_dir().resolve(), None)
 
 
 def evolve_skill(
