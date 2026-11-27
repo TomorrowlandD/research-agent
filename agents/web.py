@@ -6,10 +6,10 @@ import logging
 import math
 import os
 from pathlib import Path
-from uuid import uuid4
 
 from aiohttp import WSMsgType, web
 
+from .session_manager import SessionManager
 from .agent import Agent
 from .paths import RESEARCH_DIRNAME
 from .main import _load_env_file, _resolve_api_config
@@ -17,6 +17,7 @@ from .main import _load_env_file, _resolve_api_config
 
 DEFAULT_IDLE_TIMEOUT = 900
 IDLE_CLOSE_CODE = 4001
+SESSION_MANAGER = web.AppKey("session_manager", SessionManager)
 ASSETS = Path(__file__).with_name("web_ui")
 
 
@@ -55,98 +56,62 @@ def read_turn_trace(trace_id):
     return {"id": trace_id, "spans": rows, "partial": partial}
 
 
-class BrowserSession:
-    def __init__(self, socket, make_agent, idle_timeout):
+class SessionConnection:
+    """One bounded outgoing queue keeps a slow socket out of the Agent loop."""
+    def __init__(self, socket, events, idle_timeout):
         self.socket = socket
+        self.events = events
         self.idle_timeout = idle_timeout
-        self.idle_timer = None
-        self.pending = {}
-        self.turn = None
-        self.agent = make_agent(confirm_fn=self.confirm, output_fn=self.output)
-        self.agent.set_plan_approval_fn(self.review_plan)
+        self.timer = None
+        self.queue = asyncio.Queue(maxsize=512)
+        self.closing = False
 
-    def waiting_for_input(self, waiting):
-        # The receive handler owns this timeout; running a model/tool has no idle deadline.
-        if self.idle_timer is not None and not self.idle_timer.expired():
+    def waiting(self, waiting):
+        if self.timer is not None and not self.timer.expired():
             deadline = asyncio.get_running_loop().time() + self.idle_timeout if waiting else None
-            self.idle_timer.reschedule(deadline)
+            self.timer.reschedule(deadline)
 
-    async def output(self, text):
-        await self.socket.send_json({"type": "output", "text": text})
-
-    async def ask(self, label, message):
-        request_id = uuid4().hex
-        decision = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = decision
-        self.waiting_for_input(True)
+    def offer(self, frame):
+        if self.closing:
+            return
         try:
-            await self.socket.send_json({"type": "approval", "id": request_id, "label": label, "message": message})
-            return await decision
-        finally:
-            self.pending.pop(request_id, None)
+            self.queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            self.closing = True
+            asyncio.create_task(self.socket.close(code=1013, message=b"Reconnect to recover events"))
 
-    async def confirm(self, message):
-        return await self.ask("工具审批", message)
-
-    async def review_plan(self, content):
-        approved = await self.ask("计划审批", content)
-        return {"choice": "manual-execute" if approved else "keep-planning"}
-
-    async def run_turn(self, prompt):
-        await self.socket.send_json({"type": "started"})
-        previous_trace = self.agent.trace_id
+    async def send(self):
         try:
-            try:
-                await self.agent.chat(prompt)
-            except Exception as exc:
-                logging.getLogger(__name__).exception("Web session turn failed")
-                event = {"type": "failed", "message": f"任务中断（{type(exc).__name__}），请检查服务端日志。"}
-            else:
-                event = {"type": "complete"}
-            if not self.socket.closed:
-                if self.agent.trace_id != previous_trace:
-                    event["trace"] = await asyncio.to_thread(read_turn_trace, self.agent.trace_id)
-                await self.socket.send_json(event)
-        finally:
-            self.waiting_for_input(True)
+            while True:
+                await self.socket.send_json(await self.queue.get())
+        except Exception:
+            logging.getLogger(__name__).debug("WebSocket delivery failed", exc_info=True)
+            await self.socket.close()
 
-    async def receive(self, data):
+    def receive(self, session, data):
         kind = data.get("type") if isinstance(data, dict) else None
         if kind == "prompt":
-            prompt = data.get("text")
-            if self.turn is not None and not self.turn.done():
-                error = "当前任务尚未结束。"
-            elif not isinstance(prompt, str) or not prompt.strip():
-                error = "请输入任务。"
+            text = data.get("text")
+            if isinstance(text, str) and text.strip():
+                code = session.start(text.strip())
+                if code == "started":
+                    return
+                message = "当前任务尚未结束。" if code == "busy" else "服务正在关闭。"
             else:
-                self.waiting_for_input(False)
-                self.turn = asyncio.create_task(self.run_turn(prompt.strip()))
-                return
+                code, message = "invalid_prompt", "请输入任务。"
         elif kind == "decision":
-            key = data.get("id")
-            future = self.pending.get(key) if isinstance(key, str) else None
-            if future is None or future.done() or type(data.get("allow")) is not bool:
-                error = "审批无效或已处理。"
-            else:
-                future.set_result(data["allow"])
-                self.waiting_for_input(any(not f.done() for f in self.pending.values()))
+            code = session.decide(data.get("id"), data.get("allow"))
+            if code == "accepted":
+                if self.events:
+                    self.offer({"type": "decision_ack", "code": code, "id": data["id"]})
                 return
+            message = "审批无效或已处理。"
+        elif kind == "stop":
+            self.offer({"type": "stop_ack", "code": session.stop()})
+            return
         else:
-            error = "无效的会话消息。"
-        await self.socket.send_json({"type": "error", "message": error})
-
-    async def close(self):
-        if self.turn is not None:
-            self.turn.cancel()
-            await asyncio.gather(self.turn, return_exceptions=True)
-        try:
-            await self.agent._mcp_manager.disconnect_all()
-        finally:
-            try:
-                await self.agent.drain_background_skill_tasks()
-            finally:
-                client = self.agent._openai_client or self.agent._anthropic_client
-                await client.close()
+            code, message = "invalid_message", "无效的会话消息。"
+        self.offer({"type": "error", "code": code, "message": message})
 
 
 @web.middleware
@@ -159,10 +124,14 @@ async def local_browser(request, handler):
     return await handler(request)
 
 
-def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT):
+def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT, approval_timeout=DEFAULT_IDLE_TIMEOUT):
     if not math.isfinite(idle_timeout) or idle_timeout <= 0:
         raise ValueError("idle_timeout must be a positive finite duration")
+    if not math.isfinite(approval_timeout) or approval_timeout <= 0:
+        raise ValueError("approval_timeout must be a positive finite duration")
+    manager = SessionManager(make_agent, read_turn_trace, idle_timeout, approval_timeout)
     app = web.Application(middlewares=[local_browser])
+    app[SESSION_MANAGER] = manager
     sockets = set()
 
     async def page(request):
@@ -175,13 +144,28 @@ def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT):
 
     async def connect(request):
         socket = web.WebSocketResponse(max_msg_size=128 * 1024, heartbeat=30)
-        session = BrowserSession(socket, make_agent, idle_timeout)
+        if not socket.can_prepare(request).ok:
+            raise web.HTTPBadRequest(text="WebSocket upgrade required.")
+        key = request.query.get("session_id")
+        client = SessionConnection(socket, key is not None or request.query.get("events") == "1", idle_timeout)
+        try:
+            after = int(request.query.get("after", "0"))
+            session = await manager.attach(client, key, request.query.get("workspace_dir"), after)
+        except LookupError as exc:
+            raise web.HTTPNotFound(text=str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        except RuntimeError as exc:
+            raise web.HTTPServiceUnavailable(text=str(exc)) from exc
+
+        sender = None
         try:
             await socket.prepare(request)
             sockets.add(socket)
-            await socket.send_json({"type": "ready"})
-            async with asyncio.timeout(idle_timeout) as timer:
-                session.idle_timer = timer
+            sender = asyncio.create_task(client.send())
+            async with asyncio.timeout(None) as timer:
+                client.timer = timer
+                client.waiting(session.status != "running")
                 async for frame in socket:
                     if frame.type != WSMsgType.TEXT:
                         break
@@ -189,19 +173,24 @@ def create_app(make_agent, *, idle_timeout=DEFAULT_IDLE_TIMEOUT):
                         data = json.loads(frame.data)
                     except ValueError:
                         data = None
-                    await session.receive(data)
+                    client.receive(session, data)
         except TimeoutError:
-            if session.idle_timer is None or not session.idle_timer.expired():
+            if client.timer is None or not client.timer.expired():
                 raise
             await socket.close(code=IDLE_CLOSE_CODE, message=b"Session idle timeout")
         finally:
-            session.idle_timer = None
+            client.timer = None
+            client.closing = True
             sockets.discard(socket)
-            await session.close()
+            session.detach(client)
+            if sender is not None:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
         return socket
 
     async def shutdown(_app):
-        await asyncio.gather(*(ws.close(code=1001) for ws in list(sockets)))
+        manager.closing = True
+        await asyncio.gather(manager.shutdown(), *(ws.close(code=1001) for ws in list(sockets)))
 
     app.router.add_get("/", page)
     app.router.add_get("/{asset:app\\.js|trace\\.js|style\\.css}", page)
@@ -214,17 +203,22 @@ def main():
     parser = argparse.ArgumentParser(description="ResearchAgent 本地 Web 会话")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
-                        help="等待任务或审批的最长秒数（默认 900）")
+                        help="等待输入的连接和无连接空闲会话的超时秒数（默认 900）")
+    parser.add_argument("--approval-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
+                        help="每项审批可等待的最长秒数（默认 900）")
     args = parser.parse_args()
     if not math.isfinite(args.idle_timeout) or args.idle_timeout <= 0:
         parser.error("--idle-timeout must be a positive finite duration")
+    if not math.isfinite(args.approval_timeout) or args.approval_timeout <= 0:
+        parser.error("--approval-timeout must be a positive finite duration")
     _load_env_file()
     base, key, openai = _resolve_api_config(None)
     if not key:
         parser.error("请先在环境变量或 .env 中配置模型 API 密钥。")
     options = {"api_key": key, "api_base" if openai else "anthropic_base_url": base,
                "model": os.environ.get("MODEL") or "deepseek-chat"}
-    app = create_app(lambda **callbacks: Agent(**options, **callbacks), idle_timeout=args.idle_timeout)
+    app = create_app(lambda **callbacks: Agent(**options, **callbacks), idle_timeout=args.idle_timeout,
+                     approval_timeout=args.approval_timeout)
     web.run_app(app, host="127.0.0.1", port=args.port)
 
 

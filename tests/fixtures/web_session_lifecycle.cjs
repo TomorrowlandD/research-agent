@@ -57,7 +57,7 @@ async function main() {
     const exclude = new Set(active.map(p => p.pid));
     for (const kind of ["idle", "crash"]) {
       const tab = await start(kind);
-      if (kind === "idle") await tab.locator(".approval").filter({hasText:"browser_snapshot"}).waitFor();
+      await tab.locator(".approval").filter({hasText:"browser_snapshot"}).waitFor();
       const owned = capture(exclude);
       const startTime = Date.now();
       if (kind === "idle") {
@@ -68,6 +68,24 @@ async function main() {
         cdp.send("Page.crash").catch(() => {});
         await crashed;
       }
+      const id = (await (await fetch(url + "/ids")).json())[kind];
+      const recovered = await survivor.evaluate(id => new Promise((resolve, reject) => {
+        const ws = new WebSocket("ws://" + location.host + "/session?session_id=" + encodeURIComponent(id));
+        const timer = setTimeout(() => { ws.close(); reject(new Error("stop timed out")); }, 15000);
+        let ready;
+        ws.onmessage = ({data}) => {
+          const frame = JSON.parse(data);
+          if (frame.type === "ready") {
+            ready = frame;
+            ws.send(JSON.stringify({type:"stop"}));
+          } else if (frame.type === "event" && frame.event.payload.type === "cancelled") {
+            clearTimeout(timer);
+            ws.close();
+            resolve({status:ready.status, approvals:ready.pending_approvals.length});
+          }
+        };
+      }), id);
+      assert.deepEqual(recovered, {status:"waiting_for_approval", approvals:1});
       try {
         await until(() => stillPresent(owned).length === 0, kind + " cleanup timed out", 75000);
       } catch (error) {
@@ -76,7 +94,7 @@ async function main() {
       }
       const survivorPids = stillPresent(active).map(p => p.pid);
       assert.equal(survivorPids.length, active.length, "active session lost a process");
-      evidence[kind] = {before:owned, remaining:stillPresent(owned), survivor_pids:survivorPids,
+      evidence[kind] = {recovered, before:owned, remaining:stillPresent(owned), survivor_pids:survivorPids,
                         elapsed_ms:Date.now()-startTime};
       await tab.close();
     }

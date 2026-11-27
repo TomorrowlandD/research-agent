@@ -18,12 +18,15 @@ from agents.web import create_app
 async def exercise(output):
     repo = Path(__file__).resolve().parents[2]
     started = set()
+    session_ids = {}
     release = asyncio.Event()
 
     async def model(agent):
         history = agent._openai_messages
         label = next(m["content"] for m in history if m["role"] == "user")
         last = history[-1]
+        if not agent.is_sub_agent:
+            session_ids[label] = agent.session_id
         name = None
         args = {}
         text = None
@@ -38,7 +41,7 @@ async def exercise(output):
             if "/sample" not in last["content"]:
                 raise AssertionError("Navigation did not return the fixture page")
             started.add(label)
-            if label in {"survivor", "crash"}:
+            if label == "survivor":
                 await release.wait()
             name = "mcp__playwright__browser_snapshot"
         else:
@@ -58,6 +61,9 @@ async def exercise(output):
     async def probe(request):
         return web.json_response(sorted(started))
 
+    async def ids(request):
+        return web.json_response(session_ids)
+
     async def resume(request):
         release.set()
         return web.Response()
@@ -71,10 +77,12 @@ async def exercise(output):
         shutil.copy(repo / ".mcp.json", Path(tmp) / ".mcp.json")
         env = {"HOME": tmp, "USERPROFILE": tmp, "npm_config_cache": str(home / ".npm"),
                "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(home / ".cache/ms-playwright"))}
-        with chdir(tmp), patch.dict(os.environ, env), patch.object(Agent, "_call_openai_stream", model):
-            app = create_app(make_agent, idle_timeout=4)
+        with (chdir(tmp), patch.dict(os.environ, env), patch("agents.session.SESSION_DIR", Path(tmp) / "sessions"),
+              patch.object(Agent, "_call_openai_stream", model)):
+            app = create_app(make_agent, idle_timeout=4, approval_timeout=180)
             app.router.add_get("/sample", sample)
             app.router.add_get("/probe", probe)
+            app.router.add_get("/ids", ids)
             app.router.add_post("/release", resume)
             runner = web.AppRunner(app)
             await runner.setup()

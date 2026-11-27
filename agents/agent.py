@@ -174,6 +174,7 @@ class Agent:
                  max_output_tokens: int | None=None,
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  output_fn: Callable[[str], Awaitable[None]] | None = None,
+                 session_id: str | None = None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
                  is_sub_agent: bool=False,
@@ -251,7 +252,8 @@ class Agent:
         self._custom_system_prompt = custom_system_prompt
         self.effective_window = (CONTEXT_WINDOW - max_output_tokens - 20000
                                  if self._deepseek else _get_context_windows(model) - 20000)
-        self.session_id = uuid.uuid4().hex[:8]
+        self.session_id = uuid.uuid4().hex[:8] if session_id is None else session_id
+        validate_session_id(self.session_id)
         self._candidate_ledger = CandidateLedger(workspace_dir(), self.session_id)
         self._event_log = SessionEventLog(self.session_id, "openai" if self.use_openai else "anthropic")
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
@@ -501,6 +503,16 @@ class Agent:
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
 
+    def set_event_fn(self, fn) -> None:
+        """Receive committed journal rows in sequence on the owning event loop."""
+        self._event_log.event_fn = fn
+
+    def record_session_event(self, event: dict, *, event_type: str = "session_state", trace_id: str | None = None) -> None:
+        self._event_log.record(trace_id or self.trace_id, event_type, event)
+
+    async def flush_events(self) -> None:
+        await self._event_log.flush()
+
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
@@ -549,15 +561,15 @@ class Agent:
 
     #主入口
 
-    async def chat(self, user_message: str) -> None:
+    async def chat(self, user_message: str, *, trace_id: str | None = None) -> None:
         try:
-            await self._chat_turn(user_message)
+            await self._chat_turn(user_message, trace_id)
         finally:
             await self._event_log.flush()
 
-    async def _chat_turn(self, user_message: str) -> None:
+    async def _chat_turn(self, user_message: str, trace_id: str | None = None) -> None:
         parent = _tool_span.get()
-        self.trace_id = parent[0] if parent else uuid.uuid4().hex
+        self.trace_id = parent[0] if parent else (trace_id or uuid.uuid4().hex)
         original_user_message = _safe_utf8_text(user_message)
         self._event_log.record(self.trace_id, "user_message", {"content": original_user_message})
         #懒加载MCP服务在第一次chat的时候
@@ -1012,7 +1024,9 @@ class Agent:
                 self._plan_file_path = self._generate_plan_file_path()
         self._reset_context_budget()
         self._refresh_runtime_system_prompt()
+        event_fn = self._event_log.event_fn
         self._event_log = SessionEventLog(self.session_id, protocol)
+        self.set_event_fn(event_fn)
         self._event_log.record(self.trace_id, "session_resumed", {
             "message_count": self._get_message_count(), "schema_version": metadata.get("schema_version", 1),
         })
@@ -1077,28 +1091,32 @@ class Agent:
 
     def _auto_save(self) -> None:
         try:
-            save_session(self.session_id, {
-                "metadata": {
-                    "id": self.session_id,
-                    "session_id": self.session_id,
-                    "project_hash": _project_hash(),
-                    "protocol": "openai" if self.use_openai else "anthropic",
-                    "created_at": self.session_start_time,
-                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-                    "schema_version": 2,
-                    "model": self.model,
-                    "cwd": str(workspace_dir()),
-                    "startTime": self.session_start_time,
-                    "messageCount": self._get_message_count(),
-                    "thinking": self.thinking,
-                    "reasoningEffort": self._deepseek.effort if self._deepseek else None,
-                },
-                "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
-                "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
-                "foldedSessionMemories": _sanitize_for_utf8(self._folded_session_memories),
-            })
+            self.save_snapshot()
         except Exception:
-            pass
+            if self._event_log.event_fn is not None:
+                raise
+
+    def save_snapshot(self) -> None:
+        save_session(self.session_id, {
+            "metadata": {
+                "id": self.session_id,
+                "session_id": self.session_id,
+                "project_hash": _project_hash(),
+                "protocol": "openai" if self.use_openai else "anthropic",
+                "created_at": self.session_start_time,
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "schema_version": 2,
+                "model": self.model,
+                "cwd": str(workspace_dir()),
+                "startTime": self.session_start_time,
+                "messageCount": self._get_message_count(),
+                "thinking": self.thinking,
+                "reasoningEffort": self._deepseek.effort if self._deepseek else None,
+            },
+            "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
+            "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
+            "foldedSessionMemories": _sanitize_for_utf8(self._folded_session_memories),
+        })
 
     #自动压缩
     def _reset_context_budget(self) -> None:

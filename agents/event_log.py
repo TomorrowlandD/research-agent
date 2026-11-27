@@ -60,6 +60,20 @@ def _last_seq(stream, end: int) -> int:
     return seq
 
 
+def read_events(session_id: str) -> list[dict]:
+    session.validate_session_id(session_id)
+    path = session.SESSION_DIR / f"{session_id}.events.jsonl"
+    try:
+        with path.open(encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream]
+    except FileNotFoundError:
+        return []
+    if any(not isinstance(row, dict) or row.get("session_id") != session_id or row.get("seq") != i
+           for i, row in enumerate(rows, 1)):
+        raise ValueError("Invalid session event history.")
+    return rows
+
+
 class SessionEventLog:
     def __init__(self, session_id: str, protocol: str):
         session.validate_session_id(session_id)
@@ -68,6 +82,9 @@ class SessionEventLog:
         self._end = 0
         self._seq = 0
         self._pending = None
+        self.event_fn = None
+        self._delivery = None
+        self._delivery_error = None
 
     def record(self, trace_id: str, event_type: str, payload: dict) -> None:
         """Freeze the event now. Keep filesystem I/O off the active model loop."""
@@ -81,14 +98,37 @@ class SessionEventLog:
         self._pending = _writer.submit(self._append_at, session.SESSION_DIR, trace_id, event_type,
                                        deepcopy(payload), datetime.now(timezone.utc).isoformat())
 
+        if self.event_fn is not None:
+            self._delivery = asyncio.create_task(self._deliver(
+                self._delivery, asyncio.wrap_future(self._pending), self.event_fn,
+            ))
+
+    async def _deliver(self, previous, written, notify):
+        if previous is not None:
+            await previous
+        try:
+            event = await written
+            if event is None:
+                raise OSError("Session event could not be persisted.")
+            await notify(event)
+        except Exception as exc:
+            # Report the failed batch at flush without poisoning later deliveries.
+            self._delivery_error = exc
+
     async def flush(self) -> None:
+        if self._delivery is not None:
+            await asyncio.shield(self._delivery)
+            if self._delivery_error is not None:
+                error, self._delivery_error = self._delivery_error, None
+                raise error
+            return
         if self._pending is not None:
             await asyncio.shield(asyncio.wrap_future(self._pending))
 
     def append(self, trace_id: str, event_type: str, payload: dict) -> None:
         self._append_at(session.SESSION_DIR, trace_id, event_type, payload, datetime.now(timezone.utc).isoformat())
 
-    def _append_at(self, directory: Path, trace_id: str, event_type: str, payload: dict, timestamp: str) -> None:
+    def _append_at(self, directory: Path, trace_id: str, event_type: str, payload: dict, timestamp: str) -> dict | None:
         path = directory / f"{self.session_id}.events.jsonl"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +144,7 @@ class SessionEventLog:
                 if stream.write(line) != len(line):
                     raise OSError("incomplete event write")
                 self._end, self._seq = end + len(line), seq
+                return event
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             logging.warning("Cannot append %s to session event log %s: %s", event_type, path, exc)
 

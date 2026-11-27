@@ -40,6 +40,7 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(tmp)
+        self.enterContext(patch("agents.session.SESSION_DIR", self.root / "sessions"))
         self.workspace = self.root / "work"
         self.workspace.mkdir()
         self.enterContext(chdir(self.workspace))
