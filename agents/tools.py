@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import os
 import re
-import subprocess
 from collections.abc import Set
 from pathlib import Path
 
 from .artifacts import DECISIONS, STATUSES
 from .paths import RESEARCH_DIRNAME, workspace_dir
+from .tool_process import run_tool_process
 from .tool_result import ToolFailure
 from .web_tools import normalize_web_args, web_fetch, web_search
 
@@ -437,7 +438,7 @@ def _list_files(inp: dict) -> str:
         raise ToolFailure(f"Error listing files: {e}")
 
 
-def _grep_search(inp: dict) -> str:
+async def _grep_search(inp: dict) -> str:
     pattern = inp["pattern"]
     path = str(_resolve_tool_path(inp.get("path") or "."))
     include = inp.get("include")
@@ -449,21 +450,21 @@ def _grep_search(inp: dict) -> str:
                 args.append(f"--include={include}")
             args.extend(["--", pattern, path])
 
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 1:
+            code, stdout, _ = await run_tool_process(args, cwd=workspace_dir(), timeout=10)
+            if code == 1:
                 return "No matches found."
-            if result.returncode == 0:
-                lines = [l for l in result.stdout.split("\n") if l]
+            if code == 0:
+                lines = [l for l in stdout.split("\n") if l]
                 output = "\n".join(lines[:100])
                 if len(lines) >100:
                     output += f"\n... and {len(lines) - 100} more matches"
                 return output
-        except Exception:
+        except TimeoutError:
+            raise TimeoutError("Search timed out after 10000ms") from None
+        except (OSError, UnicodeError):
             pass
 
-    return _grep_python(pattern, path, include)
+    return await asyncio.to_thread(_grep_python, pattern, path, include)
 
 
 def _grep_python(pattern: str, directory: str, include: str | None) -> str:
@@ -571,25 +572,17 @@ def get_deferred_tool_names(
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in activated_tools]
 
 #执行shell命令
-def _run_shell(inp: dict) -> str:
+async def _run_shell(inp: dict) -> str:
+    timeout_ms = inp.get("timeout", 30000)
     try:
-        timeout_ms = inp.get("timeout", 30000)
-        timeout_s = timeout_ms / 1000
-        result = subprocess.run(
-            inp["command"],
-            shell=True,
-            cwd=workspace_dir(),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+        code, stdout, stderr = await run_tool_process(
+            inp["command"], cwd=workspace_dir(), timeout=timeout_ms / 1000,
         )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            raise ToolFailure(f"Command failed (exit code {result.returncode}){stdout}{stderr}")
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
+        if code != 0:
+            details = (f"\nStdout: {stdout}" if stdout else "") + (f"\nStderr: {stderr}" if stderr else "")
+            raise ToolFailure(f"Command failed (exit code {code}){details}")
+        return stdout or "(no output)"
+    except TimeoutError:
         raise TimeoutError(f"Command timed out after {timeout_ms}ms") from None
     except ToolFailure:
         raise
@@ -781,13 +774,16 @@ async def execute_tool(
     if name == "web_fetch":
         return await web_fetch(**normalize_web_args(name, inp))
     if name == "read_file":
-        result = _read_file(inp)
+        stamp = None
         if read_file_state is not None:
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
-                read_file_state[abs_path] =  os.path.getmtime(abs_path)
+                stamp = os.path.getmtime(abs_path)
             except OSError:
                 pass
+        result = await asyncio.to_thread(_read_file, inp)
+        if stamp is not None:
+            read_file_state[abs_path] = stamp
         return _truncate_result(result)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
@@ -852,12 +848,16 @@ async def execute_tool(
             raise ToolFailure(content)
         return content
 
+    if name == "run_shell":
+        return _truncate_result(await _run_shell(inp))
+    if name == "grep_search":
+        return _truncate_result(await _grep_search(inp))
+    if name == "list_files":
+        return _truncate_result(await asyncio.to_thread(_list_files, inp))
+
     handlers: dict = {
         "write_file": _write_file,
         "edit_file": _edit_file,
-        "list_files": _list_files,
-        "grep_search": _grep_search,
-        "run_shell": _run_shell,
     }
     handler = handlers.get(name)
 

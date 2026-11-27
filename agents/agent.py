@@ -592,7 +592,10 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
-            if self.is_sub_agent and asyncio.current_task().cancelling():
+            if asyncio.current_task().cancelling():
+                self._turn_output_buffer = None
+                if not self.is_sub_agent:
+                    self._auto_save()
                 raise
 
         finally:
@@ -1935,65 +1938,70 @@ class Agent:
             # 收集本轮所有工具结果，之后作为 tool_result 消息回传给模型。
             tool_results: list[dict] = []
             context_break = False
-
-            for tu in tool_uses:
-                # context_break 表示某个工具执行期间清理了上下文，需要停止继续处理本轮剩余工具。
-                if context_break or self._aborted:
-                    break
-
-                inp, error = prepared[tu.id]
-                if error is not None:
-                    self._record_tool_outcome(tu.name, False)
-                    tool_results.append(self._anthropic_skipped_result(tu, error))
-                    continue
-                print_tool_call(tu.name, inp)
-
-                # 工具只在完整响应及权限检查后执行。
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-                if perm["action"] == "deny":
-                    # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    self._record_tool_outcome(tu.name, False)
-                    tool_results.append(self._anthropic_skipped_result(tu, f"Action denied: {perm.get('message', '')}"))
-                    continue
-
-                if perm["action"] == "confirm":
-                    if not await self._confirm_tool_call(tu.name, perm):
-                        self._record_tool_outcome(tu.name, False)
-                        tool_results.append(self._anthropic_skipped_result(tu, "User denied this action."))
-                        continue
-
-                # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
-                outcome = await self._execute_tool_call(tu.name, inp)
-                res = self._persist_large_result(tu.name, outcome.content,
-                                                 call_id=tu.id, is_error=outcome.is_error)
-                print_tool_result(tu.name, res)
-                self._record_tool_outcome(tu.name, outcome.ok)
-
-                if tu.name == "compact_context" and self.tool_mode != "replay" and outcome.meta.get("compacted"):
-                    context_break = True
-                    break
-
-                if self._context_cleared:
-                    # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
-                    # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
-                    self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": res})
-                    context_break = True
-                    break
-
-                # Anthropic 要求 tool_result 使用 tool_use_id 对应到前面的 tool_use block。
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
-                                     "is_error": outcome.is_error})
-
-            if not context_break and tool_results:
-                # Anthropic 要求 assistant/tool_use 后面紧跟一条 user/tool_result 消息，
-                # 且这条消息必须包含本轮所有 tool_use 的对应结果。
-                self._anthropic_messages.append({"role": "user", "content": tool_results})
+            try:
+                context_break = await self._run_anthropic_tools(tool_uses, prepared, tool_results)
+            finally:
+                if not context_break:
+                    # Serial execution leaves only a suffix outstanding, including
+                    # a call interrupted during approval or process cleanup.
+                    for pending in tool_uses[len(tool_results):]:
+                        tool_results.append(self._anthropic_skipped_result(
+                            pending, "Tool execution interrupted: no result available.",
+                        ))
+                    self._anthropic_messages.append({"role": "user", "content": tool_results})
 
             self._context_cleared = False
 
             self._refresh_runtime_system_prompt()
+
+    async def _run_anthropic_tools(self, tool_uses, prepared, tool_results) -> bool:
+        for tu in tool_uses:
+            if self._aborted:
+                break
+
+            inp, error = prepared[tu.id]
+            if error is not None:
+                self._record_tool_outcome(tu.name, False)
+                tool_results.append(self._anthropic_skipped_result(tu, error))
+                continue
+            print_tool_call(tu.name, inp)
+
+            # 工具只在完整响应及权限检查后执行。
+            perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
+            if perm["action"] == "deny":
+                # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
+                print_info(f"Denied: {perm.get('message', '')}")
+                self._record_tool_outcome(tu.name, False)
+                tool_results.append(self._anthropic_skipped_result(tu, f"Action denied: {perm.get('message', '')}"))
+                continue
+
+            if perm["action"] == "confirm":
+                if not await self._confirm_tool_call(tu.name, perm):
+                    self._record_tool_outcome(tu.name, False)
+                    tool_results.append(self._anthropic_skipped_result(tu, "User denied this action."))
+                    continue
+
+            # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
+            outcome = await self._execute_tool_call(tu.name, inp)
+            res = self._persist_large_result(tu.name, outcome.content,
+                                             call_id=tu.id, is_error=outcome.is_error)
+            print_tool_result(tu.name, res)
+            self._record_tool_outcome(tu.name, outcome.ok)
+
+            if tu.name == "compact_context" and self.tool_mode != "replay" and outcome.meta.get("compacted"):
+                return True
+
+            if self._context_cleared:
+                # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
+                # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
+                self._context_cleared = False
+                self._anthropic_messages.append({"role": "user", "content": res})
+                return True
+
+            # Anthropic 要求 tool_result 使用 tool_use_id 对应到前面的 tool_use block。
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res,
+                                 "is_error": outcome.is_error})
+        return False
 
     @staticmethod
     def _raw_anthropic_block(block) -> dict:
@@ -2232,7 +2240,12 @@ class Agent:
                                         "result": f"Action denied: {perm.get('message', '')}"})
                     continue
                 if perm["action"] == "confirm":
-                    if not await self._confirm_tool_call(fn_name, perm):
+                    try:
+                        approved = await self._confirm_tool_call(fn_name, perm)
+                    except asyncio.CancelledError:
+                        self._append_openai_skipped_tool_results(tool_calls, "Tool approval interrupted.")
+                        raise
+                    if not approved:
                         self._record_tool_outcome(fn_name, False)
                         oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
                                             "result": "User denied this action."})
@@ -2265,14 +2278,21 @@ class Agent:
                         try:
                             await asyncio.gather(*tasks)
                         finally:
-                            # A sibling can be cancelled after a result was logged. Keep
-                            # that real receipt before filling the remaining IDs as skipped.
-                            for task in tasks:
-                                if task.done() and not task.cancelled() and task.exception() is None:
-                                    ct_item, res, ok = task.result()
-                                    self._record_tool_outcome(ct_item["fn"], ok)
-                                    self._openai_messages.append(
-                                        {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                            unfinished = [task for task in tasks if not task.done()]
+                            for task in unfinished:
+                                task.cancel()
+                            try:
+                                if unfinished:
+                                    await asyncio.gather(*unfinished, return_exceptions=True)
+                            finally:
+                                # A sibling can be cancelled after a result was logged. Keep
+                                # that real receipt before filling the remaining IDs as skipped.
+                                for task in tasks:
+                                    if task.done() and not task.cancelled() and task.exception() is None:
+                                        ct_item, res, ok = task.result()
+                                        self._record_tool_outcome(ct_item["fn"], ok)
+                                        self._openai_messages.append(
+                                            {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
                         for ct in batch["items"]:
                             if not ct["allowed"]:
@@ -2300,22 +2320,22 @@ class Agent:
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
             except asyncio.CancelledError:
-                self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
+                self._append_openai_skipped_tool_results(tool_calls, "Tool execution interrupted: no result available.")
                 raise
 
             if self._aborted and not oai_context_break:
-                self._append_openai_skipped_tool_results(tool_calls, "Tool execution skipped: request aborted.")
+                self._append_openai_skipped_tool_results(tool_calls, "Tool execution interrupted: no result available.")
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
 
     def _append_openai_skipped_tool_results(self, tool_calls: list[dict], reason: str) -> None:
         """Ensure every OpenAI tool_call gets a matching tool message."""
-        existing_ids = {
-            msg.get("tool_call_id")
-            for msg in self._openai_messages
-            if msg.get("role") == "tool"
-        }
+        existing_ids = set()
+        for message in reversed(self._openai_messages):
+            if message.get("role") != "tool":
+                break
+            existing_ids.add(message.get("tool_call_id"))
         for tc in tool_calls:
             if tc.get("type") != "function":
                 continue

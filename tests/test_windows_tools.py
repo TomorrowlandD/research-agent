@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,7 +26,7 @@ class WindowsReadAndSearchTests(unittest.TestCase):
         return path
 
     def search(self, pattern: str, path: Path, include: str | None = None) -> str:
-        return _grep_search({"pattern": pattern, "path": str(path), "include": include})
+        return asyncio.run(_grep_search({"pattern": pattern, "path": str(path), "include": include}))
 
     def test_utf8_and_bom_reading_and_chinese_search(self) -> None:
         for encoding in ("utf-8", "utf-8-sig"):

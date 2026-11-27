@@ -47,6 +47,7 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
         self.protocol = "openai"
         self.results = []
         self.model_gate = None
+        self.shell_command = None
         self.client = TestClient(TestServer(create_app(self.make_agent)))
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
@@ -63,10 +64,15 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
             messages = kwargs["messages"]
             last = messages[-1]
             if last["role"] == "user" and isinstance(last["content"], str):
-                args = json.dumps({"file_path": str(self.root / last["content"]), "content": "approved"})
+                if self.shell_command and last["content"] == "shell":
+                    name = "run_shell"
+                    args = json.dumps({"command": self.shell_command, "timeout": 10000})
+                else:
+                    name = "write_file"
+                    args = json.dumps({"file_path": str(self.root / last["content"]), "content": "approved"})
                 if openai:
-                    return FakeStream(chunk(calls=[call(name="write_file", args=args)], finish="tool_calls"))
-                return anthropic_stream(NS(type="tool_use", name="write_file", id="write", input={}),
+                    return FakeStream(chunk(calls=[call(name=name, args=args)], finish="tool_calls"))
+                return anthropic_stream(NS(type="tool_use", name=name, id="write", input={}),
                                         NS(partial_json=args), "tool_use")
             result = last["content"] if openai else last["content"][0]["content"]
             self.results.append(result)
@@ -116,6 +122,55 @@ class WebSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Successfully wrote", self.results[0])
         self.assertIn("User denied", self.results[1])
         await socket.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell fixture")
+    async def test_long_shell_allows_another_session_to_stream_and_approve(self):
+        self.enterContext(patch("agents.session.SESSION_DIR", self.root / "sessions"))
+        self.shell_command = "touch started; while [ ! -f release ]; do sleep 0.05; done; echo released"
+        slow = await self.connect()
+        await slow.send_json({"type": "prompt", "text": "shell"})
+        self.assertEqual((await slow.receive_json(timeout=5))["type"], "started")
+        approval = await slow.receive_json(timeout=5)
+        self.assertEqual(approval["type"], "approval")
+        await slow.send_json({"type": "decision", "id": approval["id"], "allow": True})
+        try:
+            async with asyncio.timeout(5):
+                while not (self.workspace / "started").exists():
+                    await asyncio.sleep(0.01)
+                await self.check_approval_paths()
+            self.assertTrue(all("timed out" not in result for result in self.results))
+        finally:
+            (self.workspace / "release").touch()
+        event = await slow.receive_json(timeout=5)
+        while event["type"] == "output":
+            event = await slow.receive_json(timeout=5)
+        self.assertEqual(event["type"], "complete")
+        self.assertEqual(self.results[-1], "released\n")
+        await slow.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process group")
+    async def test_server_shutdown_reaps_running_shell(self):
+        self.enterContext(patch("agents.session.SESSION_DIR", self.root / "sessions"))
+        self.shell_command = "sleep 30 & echo $$ > group; wait"
+        socket = await self.connect()
+        await socket.send_json({"type": "prompt", "text": "shell"})
+        self.assertEqual((await socket.receive_json(timeout=5))["type"], "started")
+        approval = await socket.receive_json(timeout=5)
+        await socket.send_json({"type": "decision", "id": approval["id"], "allow": True})
+        path = self.workspace / "group"
+        async with asyncio.timeout(5):
+            while not path.exists() or not path.stat().st_size:
+                await asyncio.sleep(0.01)
+            group = int(path.read_text())
+            await self.client.server.close()
+            while True:
+                try:
+                    os.killpg(group, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(group, os.WNOHANG)
 
     async def test_openai_decisions_continue_same_session(self):
         await self.check_approval_paths()

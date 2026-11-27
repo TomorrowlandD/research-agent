@@ -34,7 +34,7 @@ class LaunchTests(unittest.TestCase):
                 _write_file({"file_path": "probe", "content": "marker"})
             self.assertIn("marker", _read_file({"file_path": "probe"}))
             self.assertEqual(Path(tmp, "probe").read_text(), "marker")
-            self.assertEqual(Path(_run_shell({"command": "cd" if os.name == "nt" else "pwd"}).strip()), Path(tmp))
+            self.assertEqual(Path(asyncio.run(_run_shell({"command": "cd" if os.name == "nt" else "pwd"})).strip()), Path(tmp))
 
     def test_entry_points(self):
         for entry, argv, interactive in (
