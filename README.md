@@ -134,6 +134,8 @@ researchagent --resume SESSION_ID -p "继续分析"
 
 ## 本地 Web 会话
 
+独立的 React 前端原型位于 [web/](web/README.md)，使用模拟会话数据。在该目录运行 `npm ci` 和 `npm run dev` 可预览界面。
+
 在已配置模型的工作区启动服务。默认地址为 `http://127.0.0.1:8765/`，可用 `--port` 指定其他端口。
 
 ```bash
