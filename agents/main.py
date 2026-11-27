@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values, find_dotenv, load_dotenv
 
 from .paths import use_workspace, workspace_dir
+from rich.markup import escape
 
 from .agent import Agent
 from .ui import (
@@ -40,6 +41,32 @@ from .skills import (
     skill_stats,
 )
 from .online_skill_eval import format_online_skill_eval_async
+
+
+# The same command signatures drive REPL validation and both help screens.
+_REPL_COMMANDS = {
+    "/clear": ("", "Clear conversation history"),
+    "/plan": ("", "Toggle plan mode"),
+    "/cost": ("", "Show token usage and cost"),
+    "/compact": ("", "Manually compact conversation"),
+    "/memory": ("", "List saved memories"),
+    "/skills": ("", "List available skills"),
+    "/skill-stats": ("", "Show skill usage and evolution stats"),
+    "/skill-eval": ("", "Evaluate online skill evolution quality"),
+    "/extract_now": ("[hint]", "Extract the current pending online skill window"),
+    "/skill-feedback": ("<skill-name> <rating> [note]", "Record feedback"),
+    "/skill-evolve": ("<skill-name> <durable lesson>", "Evolve a skill"),
+    "/skill-create": ("<name> | <description> | <when-to-use> | <instructions>", "Create a skill"),
+}
+
+
+def _repl_help() -> str:
+    lines = ["REPL commands:", "  /  Show this command list"]
+    for name, (args, description) in _REPL_COMMANDS.items():
+        signature = f"{name} {args}".rstrip()
+        lines.append(f"  {signature:<18}  {description}")
+    lines.append("  /<skill-name> [args]  Invoke a user-invocable skill")
+    return "\n".join(lines)
 
 
 def parse_args(prog: str = "python -m agents.main") -> argparse.Namespace:
@@ -256,66 +283,73 @@ async def _run_repl(agent: Agent, initial_prompt: str | None = None) -> None:
             print_goodbye()
             break
 
-        # REPL commands
-        if inp == "/clear":
+        if inp == "/":
+            print(_repl_help())
+            continue
+
+        tokens = inp.split(maxsplit=1)
+        command = tokens[0]
+        cmd_args = tokens[1] if len(tokens) == 2 else ""
+        if command in _REPL_COMMANDS and cmd_args and not _REPL_COMMANDS[command][0]:
+            print_error(f"Usage: {command}")
+            continue
+
+        if command == "/clear":
             agent.clear_history()
             continue
-        if inp == "/plan":
+        if command == "/plan":
             agent.toggle_plan_mode()
             continue
-        if inp == "/cost":
+        if command == "/cost":
             agent.show_cost()
             continue
-        if inp == "/compact":
+        if command == "/compact":
             try:
                 await agent.compact()
             except Exception as e:
                 print_error(str(e))
             continue
-        if inp == "/memory":
+        if command == "/memory":
             memories = list_memories()
             if not memories:
                 print_info("No memories saved yet.")
             else:
                 print_memory_entries(memories)
             continue
-        if inp == "/skills":
+        if command == "/skills":
             skills = discover_skills()
             if not skills:
                 print_info("No skills found. Add skills to .research/skills/<name>/SKILL.md")
             else:
                 print_skill_entries(skills)
             continue
-        if inp == "/skill-stats":
+        if command == "/skill-stats":
             print_info(skill_stats())
             continue
-        if inp == "/skill-eval":
+        if command == "/skill-eval":
             side_query = agent._build_side_query(max_tokens=2400)
             print_info(await format_online_skill_eval_async(side_query=side_query))
             continue
-        if inp.startswith("/extract_now"):
-            hint = inp[len("/extract_now") :].strip()
-            result = await agent.extract_now(hint)
+        if command == "/extract_now":
+            result = await agent.extract_now(cmd_args)
             if result.get("ok"):
                 print_info("Ran online skill extraction for the current pending window.")
             else:
                 print_error(str(result.get("error") or result))
             continue
-        if inp.startswith("/skill-feedback "):
-            _, rest = inp.split(" ", 1)
-            parts = rest.strip().split(" ", 2)
+        if command == "/skill-feedback":
+            parts = cmd_args.split(maxsplit=2)
             if len(parts) < 2:
-                print_error("Usage: /skill-feedback <skill-name> <rating> [note]")
+                print_error(f"Usage: {command} {escape(_REPL_COMMANDS[command][0])}")
                 continue
             note = parts[2] if len(parts) > 2 else ""
             record_feedback(parts[0], parts[1], note)
             print_info(f"Recorded feedback for skill: {parts[0]}")
             continue
-        if inp.startswith("/skill-evolve "):
-            _, rest = inp.split(" ", 1)
-            parts = rest.strip().split(" ", 1)
+        if command == "/skill-evolve":
+            parts = cmd_args.split(maxsplit=1)
             if len(parts) < 2:
-                print_error("Usage: /skill-evolve <skill-name> <durable lesson>")
+                print_error(f"Usage: {command} {escape(_REPL_COMMANDS[command][0])}")
                 continue
             result = evolve_skill(parts[0], parts[1], rationale="Manual REPL evolution", target="active")
             if result.get("ok"):
@@ -323,11 +357,10 @@ async def _run_repl(agent: Agent, initial_prompt: str | None = None) -> None:
             else:
                 print_error(str(result.get("error") or result))
             continue
-        if inp.startswith("/skill-create "):
-            _, rest = inp.split(" ", 1)
-            parts = [part.strip() for part in rest.split("|", 3)]
+        if command == "/skill-create":
+            parts = [part.strip() for part in cmd_args.split("|", 3)]
             if len(parts) < 4 or not all(parts[:4]):
-                print_error("Usage: /skill-create <name> | <description> | <when-to-use> | <instructions>")
+                print_error(f"Usage: {command} {escape(_REPL_COMMANDS[command][0])}")
                 continue
             result = create_skill(
                 name=parts[0],
@@ -346,26 +379,25 @@ async def _run_repl(agent: Agent, initial_prompt: str | None = None) -> None:
             continue
 
         # Skill invocation: /<skill-name> [args]
-        if inp.startswith("/"):
-            space_idx = inp.find(" ")
-            cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
-            cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
-            skill = get_skill_by_name(cmd_name)
-            if skill and skill.user_invocable:
-                print_info(f"Invoking skill: {skill.name}")
-                try:
-                    if skill.context == "fork":
-                        await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
-                    else:
-                        result = execute_skill(skill.name, cmd_args)
-                        if not result:
-                            print_error(f"Unknown skill: {skill.name}")
-                            continue
-                        await agent.chat(result["prompt"])
-                except Exception as e:
-                    if "abort" not in str(e).lower():
-                        print_error(str(e))
+        if command.startswith("/") and command != "/" and "/" not in command[1:]:
+            skill = get_skill_by_name(command[1:])
+            if not skill or not skill.user_invocable:
+                print_error(f"未知命令 `{escape(command)}`。输入 / 查看可用命令。")
                 continue
+            print_info(f"Invoking skill: {skill.name}")
+            try:
+                if skill.context == "fork":
+                    await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
+                else:
+                    result = execute_skill(skill.name, cmd_args)
+                    if not result:
+                        print_error(f"Unknown skill: {skill.name}")
+                        continue
+                    await agent.chat(result["prompt"])
+            except Exception as e:
+                if "abort" not in str(e).lower():
+                    print_error(str(e))
+            continue
 
         # Normal chat
         try:
@@ -434,7 +466,7 @@ def _run_cli(*, installed: bool) -> None:
 
     if args.help:
         # 自定义帮助文本，展示 ResearchAgent 支持的启动参数和 REPL 内置命令。
-        print("""
+        print(f"""
 ResearchAgent — an evolvable research assistant CLI
 
 Usage: researchagent [options] [initial task]
@@ -462,20 +494,7 @@ Options:
   --fold-threshold X  Auto-fold threshold (0 < X < 1, default: 0.70)
   --help, -h          Show this help
 
-REPL commands:
-  /clear              Clear conversation history
-  /plan               Toggle plan mode (read-only <-> normal)
-  /cost               Show token usage and cost
-  /compact            Manually compact conversation
-  /memory             List saved memories
-  /skills             List available skills
-  /skill-stats        Show skill usage and evolution stats
-  /skill-eval         Evaluate online skill evolution quality
-  /extract_now        Extract the current pending online skill window: /extract_now [hint]
-  /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
-  /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>
-  /skill-create       Create a skill: /skill-create <name> | <description> | <when-to-use> | <instructions>
-  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
+{_repl_help()}
 
 Examples:
   researchagent "inspect this project"  # stay in the conversation
